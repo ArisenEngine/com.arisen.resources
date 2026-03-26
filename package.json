@@ -1,21 +1,21 @@
 {
-    "engineVersion":  "0.1.0",
-    "id":  "com.arisen.resources",
-    "tags":  [
-                 "serialization",
-                 "assets"
-             ],
-    "version":  "1.0.0",
-    "description":  "Asset Serialization and Model parsing systems",
-    "author":  "Arisen Team",
-    "name":  "Arisen Resources Core",
-    "dependencies":  {
-                         "com.arisen.core":  "1.0.0",
-                         "com.arisen.ecs":  "1.0.0",
-                         "com.arisen.core.native":  "1.0.0"
-                     },
-    "entry":  {
-                  "class":  "ArisenEngine.Resources.ResourcesPackage",
-                  "assembly":  "Com.Arisen.Resources.dll"
-              }
+    "engineVersion": "0.1.0",
+    "id": "com.arisen.resources",
+    "tags": [
+        "serialization",
+        "assets"
+    ],
+    "version": "1.0.0",
+    "description": "Asset Serialization and Model parsing systems",
+    "author": "Arisen Team",
+    "name": "Arisen Resources Core",
+    "dependencies": {
+        "com.arisen.core": "1.0.0",
+        "com.arisen.ecs": "1.0.0",
+        "com.arisen.core.native": "1.0.0"
+    },
+    "entry": {
+        "class": "ArisenEngine.Resources.ResourcesPackage",
+        "assembly": "Com.Arisen.Resources.dll"
+    }
 }
