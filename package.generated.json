@@ -1,0 +1,6 @@
+{
+  "entry": {
+    "assembly": "Com.Arisen.Resources.dll",
+    "class": "ArisenEngine.Resources.ResourcesPackage"
+  }
+}
