@@ -9,6 +9,11 @@
     "assembly": "Com.Arisen.Resources.dll",
     "class": "ArisenEngine.Resources.ResourcesPackage"
   },
+  "services": {
+    "provides": [
+      "ArisenEngine.Core.Assets.IAssetDatabase"
+    ]
+  },
   "dependencies": {
     "com.arisen.core": "1.0.0",
     "com.arisen.ecs": "1.0.0",
