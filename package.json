@@ -11,7 +11,8 @@
   },
   "services": {
     "provides": [
-      "ArisenEngine.Core.Assets.IAssetDatabase"
+      "ArisenEngine.Core.Assets.IAssetDatabase",
+      "ArisenEngine.Resources.Serialization.IRuntimeSceneService"
     ]
   },
   "dependencies": {
