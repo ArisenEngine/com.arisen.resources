@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using ArisenEngine.Core.Assets;
 using ArisenEngine.Core.ECS;
 
@@ -17,14 +18,20 @@ public interface IRuntimeSceneService
     event Action<RuntimeSceneState>? ActiveSceneChanged;
 
     SceneLoadResult LoadScene(AssetRef<SceneSourceAsset> scene);
+
+    void RequestSceneLoad(AssetRef<SceneSourceAsset> scene);
 }
 
 public sealed class RuntimeSceneService : IRuntimeSceneService
 {
+    private sealed record PendingSceneLoadRequest(AssetRef<SceneSourceAsset> Scene);
+
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly Action<EntityManager> m_ActivateEntityManager;
+    private RuntimeSceneState? m_ActiveScene;
+    private PendingSceneLoadRequest? m_PendingSceneLoad;
 
-    public RuntimeSceneState? ActiveScene { get; private set; }
+    public RuntimeSceneState? ActiveScene => Volatile.Read(ref m_ActiveScene);
 
     public event Action<RuntimeSceneState>? ActiveSceneChanged;
 
@@ -52,8 +59,48 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             result.SceneName,
             result.SourcePath,
             candidate);
-        ActiveScene = state;
+        Volatile.Write(ref m_ActiveScene, state);
         ActiveSceneChanged?.Invoke(state);
+        return result;
+    }
+
+    public void RequestSceneLoad(AssetRef<SceneSourceAsset> scene)
+    {
+        if (!scene.IsValid)
+        {
+            throw new ArgumentException("Queued scene load requires a valid scene asset reference.", nameof(scene));
+        }
+
+        Interlocked.Exchange(ref m_PendingSceneLoad, new PendingSceneLoadRequest(scene));
+    }
+
+    internal SceneLoadResult? ProcessPendingSceneLoadAtFrameBoundary()
+    {
+        var request = Interlocked.Exchange(ref m_PendingSceneLoad, null);
+        if (request == null)
+        {
+            return null;
+        }
+
+        SceneLoadResult result;
+        try
+        {
+            result = LoadScene(request.Scene);
+        }
+        catch (Exception ex)
+        {
+            result = new SceneLoadResult(
+                false,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                $"[RuntimeSceneService] Queued scene load failed: {ex.Message}");
+        }
+
         return result;
     }
 }

@@ -10,7 +10,7 @@ namespace ArisenEngine.Resources;
 
 public class ResourcesPackage : IPackageEntry
 {
-    private IRuntimeSceneService? m_RuntimeSceneService;
+    private RuntimeSceneService? m_RuntimeSceneService;
 
     public void OnLoad(IServiceRegistry registry)
     {
@@ -29,6 +29,7 @@ public class ResourcesPackage : IPackageEntry
             ?? throw new InvalidOperationException("Runtime scene service requires SceneSubsystem to be selected.");
         m_RuntimeSceneService = new RuntimeSceneService(database, sceneSubsystem.ActivateEntityManager);
         registry.RegisterService<IRuntimeSceneService>(m_RuntimeSceneService);
+        EngineKernel.Instance.OnFrameEnd += ProcessPendingSceneLoad;
 
         KernelLog.InfoFormat(
             "[ResourcesPackage] Loaded: indexed {0} asset(s), cooked root '{1}'.",
@@ -38,7 +39,19 @@ public class ResourcesPackage : IPackageEntry
 
     public void OnUnload(IServiceRegistry registry)
     {
+        EngineKernel.Instance.OnFrameEnd -= ProcessPendingSceneLoad;
         AssetDatabase.Instance.ReleaseAllLoadedCookedAssets();
         m_RuntimeSceneService = null;
+    }
+
+    private void ProcessPendingSceneLoad()
+    {
+        var result = m_RuntimeSceneService?.ProcessPendingSceneLoadAtFrameBoundary();
+        if (result.HasValue && !result.Value.Success)
+        {
+            KernelLog.WarningFormat(
+                "[ResourcesPackage] Queued scene activation was rejected: {0}",
+                result.Value.Diagnostic);
+        }
     }
 }
