@@ -20,7 +20,9 @@ public readonly record struct SceneLoadResult(
     int PointLightCount,
     int SpotLightCount,
     int EnvironmentCount,
-    string Diagnostic);
+    string Diagnostic,
+    string SceneName = "",
+    string SourcePath = "");
 
 public readonly record struct SceneInspectionResult(
     bool Success,
@@ -243,7 +245,11 @@ public static class SceneAssetLoader
             pointLightCount,
             spotLightCount,
             environmentCount,
-            $"[SceneAssetLoader] Loaded scene '{sceneAsset.SourcePath}' with {document.Entities.Count} entities, {cameraCount} cameras, {meshRendererCount} mesh renderers, {directionalLightCount} directional lights, {pointLightCount} point lights, {spotLightCount} spot lights, and {environmentCount} environments.");
+            $"[SceneAssetLoader] Loaded scene '{sceneAsset.SourcePath}' with {document.Entities.Count} entities, {cameraCount} cameras, {meshRendererCount} mesh renderers, {directionalLightCount} directional lights, {pointLightCount} point lights, {spotLightCount} spot lights, and {environmentCount} environments.",
+            string.IsNullOrWhiteSpace(document.Name)
+                ? Path.GetFileNameWithoutExtension(sceneAsset.SourcePath)
+                : document.Name.Trim(),
+            sceneAsset.SourcePath);
     }
 
     public static SceneInspectionResult InspectScene(
