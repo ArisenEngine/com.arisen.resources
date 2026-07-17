@@ -103,7 +103,9 @@ public sealed record SceneEnvironmentInspection(
     Vector3 AmbientColor,
     float SkyIntensity,
     float AmbientIntensity,
-    bool Enabled);
+    float Exposure,
+    bool Enabled,
+    SceneAssetReferenceInspection EnvironmentTexture);
 
 public sealed record SceneAssetReferenceInspection(
     Guid Guid,
@@ -122,6 +124,7 @@ public static class SceneAssetLoader
     private const string SceneAssetType = "Scene";
     private const string MeshAssetType = "Mesh";
     private const string MaterialAssetType = "Material";
+    private const string EnvironmentTextureAssetType = "EnvironmentTexture";
 
     public static SceneLoadResult LoadScene(
         IAssetDatabase assetDatabase,
@@ -340,7 +343,12 @@ public static class SceneAssetLoader
 
             var environment = sourceEntity.Environment == null
                 ? null
-                : InspectEnvironment(sourceEntity.Environment);
+                : InspectEnvironment(
+                    assetDatabase,
+                    sourceEntity.Environment,
+                    sceneAsset.SourcePath,
+                    entityName,
+                    diagnostics);
             if (environment != null)
             {
                 environmentCount++;
@@ -603,9 +611,27 @@ public static class SceneAssetLoader
             source.Enabled);
     }
 
-    private static SceneEnvironmentInspection InspectEnvironment(SceneEnvironmentSource source)
+    private static SceneEnvironmentInspection InspectEnvironment(
+        IAssetDatabase assetDatabase,
+        SceneEnvironmentSource source,
+        string scenePath,
+        string entityName,
+        List<string> diagnostics)
     {
         var fallback = SceneEnvironmentComponent.Default;
+        var environmentTexture = InspectOptionalAssetRef<EnvironmentTextureSourceAsset>(
+            assetDatabase,
+            source.EnvironmentTexture,
+            EnvironmentTextureAssetType,
+            scenePath,
+            entityName,
+            "Environment",
+            "EnvironmentTexture");
+        if (environmentTexture.HasValue && !environmentTexture.IsResolved)
+        {
+            diagnostics.Add(environmentTexture.Diagnostic);
+        }
+
         return new SceneEnvironmentInspection(
             ToVector3(source.SkyColor, fallback.SkyColor),
             ToVector3(source.HorizonColor, fallback.HorizonColor),
@@ -613,7 +639,9 @@ public static class SceneAssetLoader
             ToVector3(source.AmbientColor, fallback.AmbientColor),
             source.SkyIntensity >= 0.0f ? source.SkyIntensity : fallback.SkyIntensity,
             source.AmbientIntensity >= 0.0f ? source.AmbientIntensity : fallback.AmbientIntensity,
-            source.Enabled);
+            ResolveExposure(source.Exposure, fallback.Exposure),
+            source.Enabled,
+            environmentTexture);
     }
 
     private static SceneAssetReferenceInspection InspectRequiredAssetRef<TAsset>(
@@ -806,6 +834,7 @@ public static class SceneAssetLoader
     private static SceneEnvironmentComponent ToSceneEnvironment(SceneEnvironmentSource source)
     {
         var component = SceneEnvironmentComponent.Default;
+        component.EnvironmentTextureGuid = source.EnvironmentTexture?.Guid ?? Guid.Empty;
         component.SkyColor = ToVector3(source.SkyColor, component.SkyColor);
         component.HorizonColor = ToVector3(source.HorizonColor, component.HorizonColor);
         component.GroundColor = ToVector3(source.GroundColor, component.GroundColor);
@@ -816,8 +845,16 @@ public static class SceneAssetLoader
         component.AmbientIntensity = source.AmbientIntensity >= 0.0f
             ? source.AmbientIntensity
             : component.AmbientIntensity;
+        component.Exposure = ResolveExposure(source.Exposure, component.Exposure);
         component.Enabled = source.Enabled ? (byte)1 : (byte)0;
         return component;
+    }
+
+    private static float ResolveExposure(float exposure, float fallback)
+    {
+        return float.IsFinite(exposure) && exposure >= 0.0f
+            ? SceneEnvironmentComponent.NormalizeExposure(exposure)
+            : fallback;
     }
 
     private static Vector3 ToVector3(SceneVector3Source? source, Vector3 fallback)
@@ -1041,12 +1078,14 @@ public static class SceneAssetLoader
 
     private sealed class SceneEnvironmentSource
     {
+        public SceneAssetReferenceSource? EnvironmentTexture { get; set; }
         public SceneVector3Source? SkyColor { get; set; }
         public SceneVector3Source? HorizonColor { get; set; }
         public SceneVector3Source? GroundColor { get; set; }
         public SceneVector3Source? AmbientColor { get; set; }
         public float SkyIntensity { get; set; } = 0.85f;
         public float AmbientIntensity { get; set; } = 0.32f;
+        public float Exposure { get; set; } = SceneEnvironmentComponent.DefaultExposure;
         public bool Enabled { get; set; } = true;
     }
 
