@@ -18,7 +18,7 @@ public class ResourcesPackage : IPackageEntry
         var workspaceRoot = config?.ProjectRoot ?? Directory.GetCurrentDirectory();
         var packages = (config?.PackageUrls ?? new List<string>())
             .Where(Directory.Exists)
-            .Select(path => (PackageId: Path.GetFileName(path), PackageRoot: Path.GetFullPath(path)))
+            .Select(ReadPackageLocation)
             .ToArray();
 
         var database = AssetDatabase.Instance;
@@ -35,6 +35,22 @@ public class ResourcesPackage : IPackageEntry
             "[ResourcesPackage] Loaded: indexed {0} asset(s), cooked root '{1}'.",
             database.Assets.Count,
             database.CookedRoot);
+    }
+
+    private static (string PackageId, string PackageRoot) ReadPackageLocation(string packagePath)
+    {
+        string packageRoot = Path.GetFullPath(packagePath);
+        string manifestPath = Path.Combine(packageRoot, "package.json");
+        using var manifest = ManifestJson.ParseDocumentFile(manifestPath);
+        if (!manifest.RootElement.TryGetPropertyIC("id", out var idElement) ||
+            idElement.ValueKind != System.Text.Json.JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(idElement.GetString()))
+        {
+            throw new InvalidOperationException(
+                $"Asset indexing requires package manifest '{manifestPath}' to declare a non-empty id.");
+        }
+
+        return (idElement.GetString()!.Trim(), packageRoot);
     }
 
     public void OnUnload(IServiceRegistry registry)
