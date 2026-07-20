@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Numerics;
+using System.Text;
 using ArisenEngine.Core.Assets;
+using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Core.ECS;
 using YamlDotNet.RepresentationModel;
 using YamlDotNet.Serialization;
@@ -45,7 +47,21 @@ public readonly record struct SceneInspectionResult(
 
 public readonly record struct SceneAssetEditResult(
     bool Success,
-    string Diagnostic);
+    string Diagnostic,
+    string UpdatedSource = "");
+
+public sealed record SceneSourceSnapshot(
+    AssetRef<SceneSourceAsset> Scene,
+    string SourcePath,
+    string SourceText,
+    long Revision)
+{
+    public bool IsValid =>
+        Scene.IsValid &&
+        !string.IsNullOrWhiteSpace(SourcePath) &&
+        !string.IsNullOrWhiteSpace(SourceText) &&
+        Revision >= 0;
+}
 
 public sealed record SceneEntityInspection(
     string Name,
@@ -158,14 +174,78 @@ public static class SceneAssetLoader
             return Fail($"[SceneAssetLoader] Scene asset '{sceneRef.Guid:D}' source file is missing: {sceneAsset.SourcePath}");
         }
 
-        if (!TryReadSceneDocument(sceneAsset.SourcePath, out var document, out var parseDiagnostic))
+        try
+        {
+            return LoadSceneSource(
+                assetDatabase,
+                sceneAsset.SourcePath,
+                File.ReadAllText(sceneAsset.SourcePath),
+                entityManager);
+        }
+        catch (Exception ex)
+        {
+            return Fail($"[SceneAssetLoader] Failed to read scene '{sceneAsset.SourcePath}': {ex.Message}");
+        }
+    }
+
+    public static SceneLoadResult LoadScene(
+        IAssetDatabase assetDatabase,
+        SceneSourceSnapshot snapshot,
+        EntityManager entityManager)
+    {
+        if (assetDatabase == null)
+        {
+            throw new ArgumentNullException(nameof(assetDatabase));
+        }
+
+        if (snapshot == null)
+        {
+            throw new ArgumentNullException(nameof(snapshot));
+        }
+
+        if (entityManager == null)
+        {
+            throw new ArgumentNullException(nameof(entityManager));
+        }
+
+        if (!snapshot.IsValid)
+        {
+            return Fail("[SceneAssetLoader] Scene source snapshot is incomplete.");
+        }
+
+        if (!assetDatabase.TryGetAsset(snapshot.Scene, out var sceneAsset))
+        {
+            return Fail($"[SceneAssetLoader] Scene asset '{snapshot.Scene.Guid:D}' is not indexed as '{SceneAssetType}'.");
+        }
+
+        if (!IsSamePath(sceneAsset.SourcePath, snapshot.SourcePath))
+        {
+            return Fail(
+                $"[SceneAssetLoader] Scene snapshot source '{snapshot.SourcePath}' does not match indexed source '{sceneAsset.SourcePath}'.");
+        }
+
+        return LoadSceneSource(
+            assetDatabase,
+            sceneAsset.SourcePath,
+            snapshot.SourceText,
+            entityManager);
+    }
+
+    private static SceneLoadResult LoadSceneSource(
+        IAssetDatabase assetDatabase,
+        string sourcePath,
+        string sourceText,
+        EntityManager entityManager)
+    {
+        using var _ = Profiler.Zone("SceneAssetLoader.LoadSceneSource");
+        if (!TryReadSceneDocument(sourcePath, sourceText, out var document, out var parseDiagnostic))
         {
             return Fail(parseDiagnostic);
         }
 
         if (document?.Entities == null || document.Entities.Count == 0)
         {
-            return Fail($"[SceneAssetLoader] Scene '{sceneAsset.SourcePath}' has no entities.");
+            return Fail($"[SceneAssetLoader] Scene '{sourcePath}' has no entities.");
         }
 
         int cameraCount = 0;
@@ -184,7 +264,7 @@ public static class SceneAssetLoader
             var meshRenderer = sourceEntity.MeshRenderer;
             if (meshRenderer != null)
             {
-                var validation = ValidateMeshRenderer(assetDatabase, meshRenderer, sceneAsset.SourcePath, entityName);
+                var validation = ValidateMeshRenderer(assetDatabase, meshRenderer, sourcePath, entityName);
                 if (!validation.Success)
                 {
                     return validation;
@@ -236,6 +316,13 @@ public static class SceneAssetLoader
             }
         }
 
+        Profiler.PlotValue("SceneLoad.EntityCount", document.Entities.Count);
+        Profiler.PlotValue("SceneLoad.CameraCount", cameraCount);
+        Profiler.PlotValue("SceneLoad.MeshRendererCount", meshRendererCount);
+        Profiler.PlotValue("SceneLoad.DirectionalLightCount", directionalLightCount);
+        Profiler.PlotValue("SceneLoad.PointLightCount", pointLightCount);
+        Profiler.PlotValue("SceneLoad.SpotLightCount", spotLightCount);
+        Profiler.PlotValue("SceneLoad.EnvironmentCount", environmentCount);
         return new SceneLoadResult(
             true,
             document.Entities.Count,
@@ -245,11 +332,11 @@ public static class SceneAssetLoader
             pointLightCount,
             spotLightCount,
             environmentCount,
-            $"[SceneAssetLoader] Loaded scene '{sceneAsset.SourcePath}' with {document.Entities.Count} entities, {cameraCount} cameras, {meshRendererCount} mesh renderers, {directionalLightCount} directional lights, {pointLightCount} point lights, {spotLightCount} spot lights, and {environmentCount} environments.",
+            $"[SceneAssetLoader] Loaded scene '{sourcePath}' with {document.Entities.Count} entities, {cameraCount} cameras, {meshRendererCount} mesh renderers, {directionalLightCount} directional lights, {pointLightCount} point lights, {spotLightCount} spot lights, and {environmentCount} environments.",
             string.IsNullOrWhiteSpace(document.Name)
-                ? Path.GetFileNameWithoutExtension(sceneAsset.SourcePath)
+                ? Path.GetFileNameWithoutExtension(sourcePath)
                 : document.Name.Trim(),
-            sceneAsset.SourcePath);
+            sourcePath);
     }
 
     public static SceneInspectionResult InspectScene(
@@ -278,16 +365,72 @@ public static class SceneAssetLoader
                 sceneAsset.SourcePath);
         }
 
-        if (!TryReadSceneDocument(sceneAsset.SourcePath, out var document, out var parseDiagnostic))
+        try
         {
-            return FailInspection(parseDiagnostic, sceneAsset.SourcePath);
+            return InspectSceneSource(
+                assetDatabase,
+                sceneAsset.SourcePath,
+                File.ReadAllText(sceneAsset.SourcePath));
+        }
+        catch (Exception ex)
+        {
+            return FailInspection(
+                $"[SceneAssetLoader] Failed to read scene '{sceneAsset.SourcePath}': {ex.Message}",
+                sceneAsset.SourcePath);
+        }
+    }
+
+    public static SceneInspectionResult InspectScene(
+        IAssetDatabase assetDatabase,
+        SceneSourceSnapshot snapshot)
+    {
+        if (assetDatabase == null)
+        {
+            throw new ArgumentNullException(nameof(assetDatabase));
+        }
+
+        if (snapshot == null)
+        {
+            throw new ArgumentNullException(nameof(snapshot));
+        }
+
+        if (!snapshot.IsValid)
+        {
+            return FailInspection("[SceneAssetLoader] Scene source snapshot is incomplete.");
+        }
+
+        if (!assetDatabase.TryGetAsset(snapshot.Scene, out var sceneAsset))
+        {
+            return FailInspection(
+                $"[SceneAssetLoader] Scene asset '{snapshot.Scene.Guid:D}' is not indexed as '{SceneAssetType}'.",
+                snapshot.SourcePath);
+        }
+
+        if (!IsSamePath(sceneAsset.SourcePath, snapshot.SourcePath))
+        {
+            return FailInspection(
+                $"[SceneAssetLoader] Scene snapshot source '{snapshot.SourcePath}' does not match indexed source '{sceneAsset.SourcePath}'.",
+                snapshot.SourcePath);
+        }
+
+        return InspectSceneSource(assetDatabase, sceneAsset.SourcePath, snapshot.SourceText);
+    }
+
+    private static SceneInspectionResult InspectSceneSource(
+        IAssetDatabase assetDatabase,
+        string sourcePath,
+        string sourceText)
+    {
+        if (!TryReadSceneDocument(sourcePath, sourceText, out var document, out var parseDiagnostic))
+        {
+            return FailInspection(parseDiagnostic, sourcePath);
         }
 
         if (document?.Entities == null || document.Entities.Count == 0)
         {
             return FailInspection(
-                $"[SceneAssetLoader] Scene '{sceneAsset.SourcePath}' has no entities.",
-                sceneAsset.SourcePath,
+                $"[SceneAssetLoader] Scene '{sourcePath}' has no entities.",
+                sourcePath,
                 document?.Name ?? string.Empty);
         }
 
@@ -317,7 +460,7 @@ public static class SceneAssetLoader
 
             var meshRenderer = sourceEntity.MeshRenderer == null
                 ? null
-                : InspectMeshRenderer(assetDatabase, sourceEntity.MeshRenderer, sceneAsset.SourcePath, entityName, diagnostics);
+                : InspectMeshRenderer(assetDatabase, sourceEntity.MeshRenderer, sourcePath, entityName, diagnostics);
             if (meshRenderer != null)
             {
                 meshRendererCount++;
@@ -352,7 +495,7 @@ public static class SceneAssetLoader
                 : InspectEnvironment(
                     assetDatabase,
                     sourceEntity.Environment,
-                    sceneAsset.SourcePath,
+                    sourcePath,
                     entityName,
                     diagnostics);
             if (environment != null)
@@ -374,7 +517,7 @@ public static class SceneAssetLoader
         return new SceneInspectionResult(
             diagnostics.Count == 0,
             document.Name ?? string.Empty,
-            sceneAsset.SourcePath,
+            sourcePath,
             document.Entities.Count,
             cameraCount,
             meshRendererCount,
@@ -408,8 +551,52 @@ public static class SceneAssetLoader
 
         try
         {
+            byte[] sourceFile = File.ReadAllBytes(sourcePath);
+            bool hasUtf8Bom = sourceFile.AsSpan().StartsWith(Encoding.UTF8.Preamble);
+            var sourceBytes = hasUtf8Bom
+                ? sourceFile.AsSpan(Encoding.UTF8.Preamble.Length)
+                : sourceFile.AsSpan();
+            string sourceText = Encoding.UTF8.GetString(sourceBytes);
+            var result = UpdateEntityTransformSource(sourcePath, sourceText, entityIndex, transform);
+            if (!result.Success)
+            {
+                return result;
+            }
+
+            WriteUtf8Atomically(sourcePath, result.UpdatedSource, hasUtf8Bom);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            return FailEdit($"[SceneAssetLoader] Failed to update scene '{sourcePath}': {ex.Message}");
+        }
+    }
+
+    public static SceneAssetEditResult UpdateEntityTransformSource(
+        string sourcePath,
+        string sourceText,
+        int entityIndex,
+        SceneTransformInspection transform)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath))
+        {
+            return FailEdit("[SceneAssetLoader] Scene source path is empty.");
+        }
+
+        if (string.IsNullOrWhiteSpace(sourceText))
+        {
+            return FailEdit($"[SceneAssetLoader] Scene '{sourcePath}' source text is empty.");
+        }
+
+        if (entityIndex < 0)
+        {
+            return FailEdit($"[SceneAssetLoader] Scene entity index '{entityIndex}' is invalid.");
+        }
+
+        try
+        {
             var stream = new YamlStream();
-            using (var reader = File.OpenText(sourcePath))
+            using (var reader = new StringReader(sourceText))
             {
                 stream.Load(reader);
             }
@@ -441,18 +628,23 @@ public static class SceneAssetLoader
             SetChild(transformNode, "Rotation", CreateQuaternionNode(transform.Rotation));
             SetChild(transformNode, "Scale", CreateVector3Node(transform.Scale));
 
-            using (var writer = new StreamWriter(sourcePath, append: false))
+            var updated = new StringBuilder(sourceText.Length + 128);
+            using (var writer = new StringWriter(updated, CultureInfo.InvariantCulture)
+            {
+                NewLine = DetectNewline(sourceText)
+            })
             {
                 stream.Save(writer, assignAnchors: false);
             }
 
             return new SceneAssetEditResult(
                 true,
-                $"[SceneAssetLoader] Updated transform for scene '{sourcePath}' entity index '{entityIndex}'.");
+                $"[SceneAssetLoader] Updated transform for scene '{sourcePath}' entity index '{entityIndex}'.",
+                updated.ToString());
         }
         catch (Exception ex)
         {
-            return FailEdit($"[SceneAssetLoader] Failed to update scene '{sourcePath}': {ex.Message}");
+            return FailEdit($"[SceneAssetLoader] Failed to edit scene '{sourcePath}': {ex.Message}");
         }
     }
 
@@ -499,6 +691,7 @@ public static class SceneAssetLoader
 
     private static bool TryReadSceneDocument(
         string sourcePath,
+        string sourceText,
         out SceneSourceDocument? document,
         out string diagnostic)
     {
@@ -508,7 +701,7 @@ public static class SceneAssetLoader
                 .WithNamingConvention(PascalCaseNamingConvention.Instance)
                 .IgnoreUnmatchedProperties()
                 .Build();
-            document = deserializer.Deserialize<SceneSourceDocument>(File.ReadAllText(sourcePath));
+            document = deserializer.Deserialize<SceneSourceDocument>(sourceText);
             diagnostic = string.Empty;
             return true;
         }
@@ -517,6 +710,71 @@ public static class SceneAssetLoader
             document = null;
             diagnostic = $"[SceneAssetLoader] Failed to parse scene '{sourcePath}': {ex.Message}";
             return false;
+        }
+    }
+
+    private static bool IsSamePath(string left, string right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+        {
+            return false;
+        }
+
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string DetectNewline(string sourceText)
+    {
+        int lineFeed = sourceText.IndexOf('\n');
+        return lineFeed > 0 && sourceText[lineFeed - 1] == '\r'
+            ? "\r\n"
+            : "\n";
+    }
+
+    private static void WriteUtf8Atomically(string path, string sourceText, bool includeBom)
+    {
+        string fullPath = Path.GetFullPath(path);
+        string directory = Path.GetDirectoryName(fullPath)
+            ?? throw new InvalidOperationException("Scene source path has no parent directory.");
+        string temporaryPath = Path.Combine(
+            directory,
+            $".{Path.GetFileName(fullPath)}.{Guid.NewGuid():N}.tmp");
+
+        byte[] sourceBytes = Encoding.UTF8.GetBytes(sourceText);
+        byte[] output;
+        if (includeBom)
+        {
+            byte[] preamble = Encoding.UTF8.GetPreamble();
+            output = new byte[preamble.Length + sourceBytes.Length];
+            preamble.CopyTo(output, 0);
+            sourceBytes.CopyTo(output, preamble.Length);
+        }
+        else
+        {
+            output = sourceBytes;
+        }
+
+        try
+        {
+            File.WriteAllBytes(temporaryPath, output);
+            File.Move(temporaryPath, fullPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+            {
+                File.Delete(temporaryPath);
+            }
         }
     }
 
