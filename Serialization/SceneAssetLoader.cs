@@ -24,7 +24,8 @@ public readonly record struct SceneLoadResult(
     int EnvironmentCount,
     string Diagnostic,
     string SceneName = "",
-    string SourcePath = "");
+    string SourcePath = "",
+    SceneAuthoringEntityMap? AuthoringEntities = null);
 
 public readonly record struct SceneInspectionResult(
     bool Success,
@@ -64,6 +65,9 @@ public sealed record SceneSourceSnapshot(
 }
 
 public sealed record SceneEntityInspection(
+    Guid AuthoringGuid,
+    Guid ParentGuid,
+    Guid ParentSceneGuid,
     string Name,
     SceneTransformInspection Transform,
     SceneCameraInspection? Camera,
@@ -137,6 +141,40 @@ public sealed record SceneAssetReferenceInspection(
     public bool HasValue => Guid != Guid.Empty;
 }
 
+public sealed class SceneAuthoringEntityMap
+{
+    private readonly EntityManager m_EntityManager;
+    private readonly Guid[] m_AuthoringGuids;
+    private readonly Entity[] m_RuntimeEntities;
+
+    internal SceneAuthoringEntityMap(
+        EntityManager entityManager,
+        Guid[] authoringGuids,
+        Entity[] runtimeEntities)
+    {
+        m_EntityManager = entityManager;
+        m_AuthoringGuids = authoringGuids;
+        m_RuntimeEntities = runtimeEntities;
+    }
+
+    public int Count => m_AuthoringGuids.Length;
+
+    internal Entity[] RuntimeEntities => m_RuntimeEntities;
+
+    public bool TryGetEntity(Guid authoringGuid, out Entity entity)
+    {
+        int index = Array.BinarySearch(m_AuthoringGuids, authoringGuid);
+        if (index >= 0 && m_EntityManager.IsAlive(m_RuntimeEntities[index]))
+        {
+            entity = m_RuntimeEntities[index];
+            return true;
+        }
+
+        entity = Entity.Null;
+        return false;
+    }
+}
+
 public static class SceneAssetLoader
 {
     private const string SceneAssetType = "Scene";
@@ -159,33 +197,12 @@ public static class SceneAssetLoader
             throw new ArgumentNullException(nameof(entityManager));
         }
 
-        if (!sceneRef.IsValid)
+        if (!TryLoadSceneStaging(assetDatabase, sceneRef, out var staging, out var diagnostic))
         {
-            return Fail($"[SceneAssetLoader] Scene asset ref is empty.");
+            return Fail(diagnostic);
         }
 
-        if (!assetDatabase.TryGetAsset(sceneRef, out var sceneAsset))
-        {
-            return Fail($"[SceneAssetLoader] Scene asset '{sceneRef.Guid:D}' is not indexed as '{SceneAssetType}'.");
-        }
-
-        if (!File.Exists(sceneAsset.SourcePath))
-        {
-            return Fail($"[SceneAssetLoader] Scene asset '{sceneRef.Guid:D}' source file is missing: {sceneAsset.SourcePath}");
-        }
-
-        try
-        {
-            return LoadSceneSource(
-                assetDatabase,
-                sceneAsset.SourcePath,
-                File.ReadAllText(sceneAsset.SourcePath),
-                entityManager);
-        }
-        catch (Exception ex)
-        {
-            return Fail($"[SceneAssetLoader] Failed to read scene '{sceneAsset.SourcePath}': {ex.Message}");
-        }
+        return InstantiateStagedScene(staging, entityManager, "source");
     }
 
     public static SceneLoadResult LoadScene(
@@ -208,52 +225,159 @@ public static class SceneAssetLoader
             throw new ArgumentNullException(nameof(entityManager));
         }
 
+        if (!TryLoadSceneStaging(assetDatabase, snapshot, out var staging, out var diagnostic))
+        {
+            return Fail(diagnostic);
+        }
+
+        return InstantiateStagedScene(staging, entityManager, "source");
+    }
+
+    internal static bool TryLoadSceneStaging(
+        IAssetDatabase assetDatabase,
+        AssetRef<SceneSourceAsset> sceneRef,
+        out SceneStagingData staging,
+        out string diagnostic)
+    {
+        staging = null!;
+        if (!sceneRef.IsValid)
+        {
+            diagnostic = "[SceneAssetLoader] Scene asset ref is empty.";
+            return false;
+        }
+
+        if (!assetDatabase.TryGetAsset(sceneRef, out var sceneAsset))
+        {
+            diagnostic =
+                $"[SceneAssetLoader] Scene asset '{sceneRef.Guid:D}' is not indexed as '{SceneAssetType}'.";
+            return false;
+        }
+
+        if (!File.Exists(sceneAsset.SourcePath))
+        {
+            diagnostic =
+                $"[SceneAssetLoader] Scene asset '{sceneRef.Guid:D}' source file is missing: {sceneAsset.SourcePath}";
+            return false;
+        }
+
+        try
+        {
+            return TryLoadSceneSourceStaging(
+                assetDatabase,
+                sceneRef.Guid,
+                sceneAsset.SourcePath,
+                File.ReadAllText(sceneAsset.SourcePath),
+                out staging,
+                out diagnostic);
+        }
+        catch (Exception ex)
+        {
+            diagnostic =
+                $"[SceneAssetLoader] Failed to read scene '{sceneAsset.SourcePath}': {ex.Message}";
+            return false;
+        }
+    }
+
+    internal static bool TryLoadSceneStaging(
+        IAssetDatabase assetDatabase,
+        SceneSourceSnapshot snapshot,
+        out SceneStagingData staging,
+        out string diagnostic)
+    {
+        staging = null!;
         if (!snapshot.IsValid)
         {
-            return Fail("[SceneAssetLoader] Scene source snapshot is incomplete.");
+            diagnostic = "[SceneAssetLoader] Scene source snapshot is incomplete.";
+            return false;
         }
 
         if (!assetDatabase.TryGetAsset(snapshot.Scene, out var sceneAsset))
         {
-            return Fail($"[SceneAssetLoader] Scene asset '{snapshot.Scene.Guid:D}' is not indexed as '{SceneAssetType}'.");
+            diagnostic =
+                $"[SceneAssetLoader] Scene asset '{snapshot.Scene.Guid:D}' is not indexed as '{SceneAssetType}'.";
+            return false;
         }
 
         if (!IsSamePath(sceneAsset.SourcePath, snapshot.SourcePath))
         {
-            return Fail(
-                $"[SceneAssetLoader] Scene snapshot source '{snapshot.SourcePath}' does not match indexed source '{sceneAsset.SourcePath}'.");
+            diagnostic =
+                $"[SceneAssetLoader] Scene snapshot source '{snapshot.SourcePath}' does not match indexed source '{sceneAsset.SourcePath}'.";
+            return false;
         }
 
-        return LoadSceneSource(
+        return TryLoadSceneSourceStaging(
             assetDatabase,
+            snapshot.Scene.Guid,
             sceneAsset.SourcePath,
             snapshot.SourceText,
-            entityManager);
+            out staging,
+            out diagnostic);
     }
 
-    private static SceneLoadResult LoadSceneSource(
+    private static bool TryLoadSceneSourceStaging(
         IAssetDatabase assetDatabase,
+        Guid sceneGuid,
         string sourcePath,
         string sourceText,
-        EntityManager entityManager)
+        out SceneStagingData staging,
+        out string diagnostic)
     {
         using var _ = Profiler.Zone("SceneAssetLoader.LoadSceneSource");
-        if (!TryReadSceneDocument(sourcePath, sourceText, out var document, out var parseDiagnostic))
+        return TryBuildSceneStaging(
+            assetDatabase,
+            sceneGuid,
+            sourcePath,
+            sourceText,
+            out staging,
+            out diagnostic);
+    }
+
+    internal static bool TryBuildSceneStaging(
+        IAssetDatabase assetDatabase,
+        Guid sceneGuid,
+        string sourcePath,
+        string sourceText,
+        out SceneStagingData staging,
+        out string diagnostic)
+    {
+        staging = null!;
+        if (sceneGuid == Guid.Empty)
         {
-            return Fail(parseDiagnostic);
+            diagnostic = "[SceneAssetLoader] Scene source has no stable asset GUID.";
+            return false;
         }
 
-        if (document?.Entities == null || document.Entities.Count == 0)
+        if (!TryReadSceneDocument(sourcePath, sourceText, out var document, out diagnostic))
         {
-            return Fail($"[SceneAssetLoader] Scene '{sourcePath}' has no entities.");
+            return false;
         }
 
-        int cameraCount = 0;
-        int meshRendererCount = 0;
-        int directionalLightCount = 0;
-        int pointLightCount = 0;
-        int spotLightCount = 0;
-        int environmentCount = 0;
+        if (document == null || document.Entities == null || document.Entities.Count == 0)
+        {
+            diagnostic = $"[SceneAssetLoader] Scene '{sourcePath}' has no entities.";
+            return false;
+        }
+
+        if (document.Version != SceneComponentSchemas.CurrentSceneVersion)
+        {
+            diagnostic =
+                $"[SceneAssetLoader] Scene '{sourcePath}' schema version '{document.Version}' is not supported.";
+            return false;
+        }
+
+        var componentSchemas = new SceneComponentSchemaInfo[document.ComponentSchemas.Count];
+        for (int i = 0; i < document.ComponentSchemas.Count; i++)
+        {
+            var schema = document.ComponentSchemas[i];
+            componentSchemas[i] = new SceneComponentSchemaInfo(
+                schema.TypeId,
+                schema.Name,
+                schema.Version,
+                schema.Required);
+        }
+        Array.Sort(componentSchemas, static (left, right) => left.TypeId.CompareTo(right.TypeId));
+
+        var entities = new SceneStagingEntity[document.Entities.Count];
         for (int i = 0; i < document.Entities.Count; i++)
         {
             var sourceEntity = document.Entities[i];
@@ -267,76 +391,329 @@ public static class SceneAssetLoader
                 var validation = ValidateMeshRenderer(assetDatabase, meshRenderer, sourcePath, entityName);
                 if (!validation.Success)
                 {
-                    return validation;
+                    diagnostic = validation.Diagnostic;
+                    return false;
                 }
             }
 
-            var entity = entityManager.CreateEntity();
-            if (!string.IsNullOrWhiteSpace(sourceEntity.Name))
+            Guid parentGuid = sourceEntity.Parent?.EntityGuid ?? Guid.Empty;
+            Guid parentSceneGuid = sourceEntity.Parent?.SceneGuid ?? Guid.Empty;
+            if (sourceEntity.Parent != null && parentGuid == Guid.Empty)
             {
-                entityManager.AddComponent(entity, new NameComponent { Name = sourceEntity.Name.Trim() });
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{sourcePath}' entity '{sourceEntity.Guid:D}' has a Parent without EntityGuid.";
+                return false;
             }
 
-            entityManager.AddComponent(entity, ToTransform(sourceEntity.Transform));
-
-            if (sourceEntity.Camera != null)
+            if (parentSceneGuid != Guid.Empty && parentSceneGuid != sceneGuid)
             {
-                entityManager.AddComponent(entity, ToCamera(sourceEntity.Camera));
-                cameraCount++;
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{sourcePath}' entity '{sourceEntity.Guid:D}' references parent '{parentGuid:D}' in external scene '{parentSceneGuid:D}'. Cross-scene entity references require the future world-reference policy.";
+                return false;
             }
 
-            if (sourceEntity.DirectionalLight != null)
+            var stagedEntity = new SceneStagingEntity(
+                sourceEntity.Guid,
+                parentGuid,
+                string.IsNullOrWhiteSpace(sourceEntity.Name) ? string.Empty : sourceEntity.Name.Trim(),
+                ToTransform(sourceEntity.Transform),
+                sourceEntity.Camera == null ? null : ToCamera(sourceEntity.Camera),
+                meshRenderer == null ? null : ToMeshRenderer(meshRenderer),
+                NormalizePackageId(meshRenderer?.Mesh?.PackageId),
+                NormalizePackageId(meshRenderer?.Material?.PackageId),
+                sourceEntity.DirectionalLight == null
+                    ? null
+                    : ToDirectionalLight(sourceEntity.DirectionalLight),
+                sourceEntity.PointLight == null
+                    ? null
+                    : ToPointLight(sourceEntity.PointLight),
+                sourceEntity.SpotLight == null
+                    ? null
+                    : ToSpotLight(sourceEntity.SpotLight),
+                sourceEntity.Environment == null
+                    ? null
+                    : ToSceneEnvironment(sourceEntity.Environment),
+                NormalizePackageId(sourceEntity.Environment?.EnvironmentTexture?.PackageId));
+            if (!SceneStagingValidation.TryValidate(
+                    stagedEntity,
+                    i,
+                    sourcePath,
+                    out diagnostic))
             {
-                entityManager.AddComponent(entity, ToDirectionalLight(sourceEntity.DirectionalLight));
-                directionalLightCount++;
+                return false;
             }
 
-            if (sourceEntity.PointLight != null)
+            entities[i] = stagedEntity;
+        }
+
+        Array.Sort(
+            entities,
+            static (left, right) => left.AuthoringGuid.CompareTo(right.AuthoringGuid));
+
+        string sceneName = string.IsNullOrWhiteSpace(document.Name)
+            ? Path.GetFileNameWithoutExtension(sourcePath)
+            : document.Name.Trim();
+        staging = new SceneStagingData(
+            sceneGuid,
+            document.Version,
+            sceneName,
+            sourcePath,
+            componentSchemas,
+            entities);
+        if (!TryValidateStagedHierarchy(staging, out diagnostic))
+        {
+            staging = null!;
+            return false;
+        }
+
+        diagnostic = string.Empty;
+        return true;
+    }
+
+    internal static SceneLoadResult InstantiateStagedScene(
+        SceneStagingData staging,
+        EntityManager entityManager,
+        string sourceKind)
+    {
+        var runtimeEntities = new Entity[staging.Entities.Length];
+        var authoringGuids = new Guid[staging.Entities.Length];
+        var runtimeLookup = new Dictionary<Guid, Entity>(staging.Entities.Length);
+        int createdEntityCount = 0;
+        try
+        {
+            for (int i = 0; i < staging.Entities.Length; i++)
             {
-                entityManager.AddComponent(entity, ToPointLight(sourceEntity.PointLight));
-                pointLightCount++;
+                runtimeEntities[i] = entityManager.CreateEntity();
+                createdEntityCount++;
+                authoringGuids[i] = staging.Entities[i].AuthoringGuid;
+                runtimeLookup.Add(authoringGuids[i], runtimeEntities[i]);
             }
 
-            if (sourceEntity.SpotLight != null)
+            int cameraCount = 0;
+            int meshRendererCount = 0;
+            int directionalLightCount = 0;
+            int pointLightCount = 0;
+            int spotLightCount = 0;
+            int environmentCount = 0;
+            for (int i = 0; i < staging.Entities.Length; i++)
             {
-                entityManager.AddComponent(entity, ToSpotLight(sourceEntity.SpotLight));
-                spotLightCount++;
+                ref readonly SceneStagingEntity stagedEntity = ref staging.Entities[i];
+                Entity entity = runtimeEntities[i];
+                if (!string.IsNullOrEmpty(stagedEntity.Name))
+                {
+                    entityManager.AddComponent(entity, new NameComponent { Name = stagedEntity.Name });
+                }
+
+                entityManager.AddComponent(entity, stagedEntity.Transform);
+                if (stagedEntity.Camera is { } camera)
+                {
+                    entityManager.AddComponent(entity, camera);
+                    cameraCount++;
+                }
+
+                if (stagedEntity.DirectionalLight is { } directionalLight)
+                {
+                    entityManager.AddComponent(entity, directionalLight);
+                    directionalLightCount++;
+                }
+
+                if (stagedEntity.PointLight is { } pointLight)
+                {
+                    entityManager.AddComponent(entity, pointLight);
+                    pointLightCount++;
+                }
+
+                if (stagedEntity.SpotLight is { } spotLight)
+                {
+                    entityManager.AddComponent(entity, spotLight);
+                    spotLightCount++;
+                }
+
+                if (stagedEntity.Environment is { } environment)
+                {
+                    entityManager.AddComponent(entity, environment);
+                    environmentCount++;
+                }
+
+                if (stagedEntity.MeshRenderer is { } meshRenderer)
+                {
+                    entityManager.AddComponent(entity, meshRenderer);
+                    meshRendererCount++;
+                }
             }
 
-            if (sourceEntity.Environment != null)
+            var firstChildren = new Dictionary<Guid, Entity>();
+            var previousChildren = new Dictionary<Guid, Entity>();
+            var childCounts = new Dictionary<Guid, int>();
+            for (int i = 0; i < staging.Entities.Length; i++)
             {
-                entityManager.AddComponent(entity, ToSceneEnvironment(sourceEntity.Environment));
-                environmentCount++;
+                ref readonly SceneStagingEntity stagedEntity = ref staging.Entities[i];
+                if (stagedEntity.ParentGuid == Guid.Empty)
+                {
+                    continue;
+                }
+
+                Entity child = runtimeEntities[i];
+                Entity parent = runtimeLookup[stagedEntity.ParentGuid];
+                entityManager.AddComponent(child, new ParentComponent { Parent = parent });
+
+                Entity previous = Entity.Null;
+                if (previousChildren.TryGetValue(stagedEntity.ParentGuid, out var previousChild))
+                {
+                    previous = previousChild;
+                    ref var previousSibling = ref entityManager.GetComponent<SiblingComponent>(previousChild);
+                    previousSibling.NextSibling = child;
+                }
+                else
+                {
+                    firstChildren.Add(stagedEntity.ParentGuid, child);
+                }
+
+                entityManager.AddComponent(
+                    child,
+                    new SiblingComponent
+                    {
+                        PrevSibling = previous,
+                        NextSibling = Entity.Null
+                    });
+                previousChildren[stagedEntity.ParentGuid] = child;
+                childCounts.TryGetValue(stagedEntity.ParentGuid, out int childCount);
+                childCounts[stagedEntity.ParentGuid] = childCount + 1;
             }
 
-            if (meshRenderer != null)
+            foreach (var childList in firstChildren)
             {
-                entityManager.AddComponent(entity, ToMeshRenderer(meshRenderer));
-                meshRendererCount++;
+                entityManager.AddComponent(
+                    runtimeLookup[childList.Key],
+                    new ChildComponent
+                    {
+                        FirstChild = childList.Value,
+                        ChildCount = childCounts[childList.Key]
+                    });
+            }
+
+            var authoringEntityMap = new SceneAuthoringEntityMap(
+                entityManager,
+                authoringGuids,
+                runtimeEntities);
+
+            Profiler.PlotValue("SceneLoad.EntityCount", staging.Entities.Length);
+            Profiler.PlotValue("SceneLoad.CameraCount", cameraCount);
+            Profiler.PlotValue("SceneLoad.MeshRendererCount", meshRendererCount);
+            Profiler.PlotValue("SceneLoad.DirectionalLightCount", directionalLightCount);
+            Profiler.PlotValue("SceneLoad.PointLightCount", pointLightCount);
+            Profiler.PlotValue("SceneLoad.SpotLightCount", spotLightCount);
+            Profiler.PlotValue("SceneLoad.EnvironmentCount", environmentCount);
+            return new SceneLoadResult(
+                true,
+                staging.Entities.Length,
+                cameraCount,
+                meshRendererCount,
+                directionalLightCount,
+                pointLightCount,
+                spotLightCount,
+                environmentCount,
+                $"[SceneAssetLoader] Loaded {sourceKind} scene '{staging.DiagnosticPath}' with {staging.Entities.Length} entities, {cameraCount} cameras, {meshRendererCount} mesh renderers, {directionalLightCount} directional lights, {pointLightCount} point lights, {spotLightCount} spot lights, and {environmentCount} environments.",
+                staging.SceneName,
+                staging.DiagnosticPath,
+                authoringEntityMap);
+        }
+        catch
+        {
+            for (int i = createdEntityCount - 1; i >= 0; i--)
+            {
+                entityManager.TryDestroyEntity(runtimeEntities[i]);
+            }
+            throw;
+        }
+    }
+
+    internal static bool TryValidateStagedHierarchy(
+        SceneStagingData staging,
+        out string diagnostic)
+    {
+        var indices = new Dictionary<Guid, int>(staging.Entities.Length);
+        for (int i = 0; i < staging.Entities.Length; i++)
+        {
+            Guid authoringGuid = staging.Entities[i].AuthoringGuid;
+            if (authoringGuid == Guid.Empty)
+            {
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{staging.DiagnosticPath}' entity {i} has no authoring GUID.";
+                return false;
+            }
+
+            if (!indices.TryAdd(authoringGuid, i))
+            {
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{staging.DiagnosticPath}' contains duplicate entity GUID '{authoringGuid:D}'.";
+                return false;
             }
         }
 
-        Profiler.PlotValue("SceneLoad.EntityCount", document.Entities.Count);
-        Profiler.PlotValue("SceneLoad.CameraCount", cameraCount);
-        Profiler.PlotValue("SceneLoad.MeshRendererCount", meshRendererCount);
-        Profiler.PlotValue("SceneLoad.DirectionalLightCount", directionalLightCount);
-        Profiler.PlotValue("SceneLoad.PointLightCount", pointLightCount);
-        Profiler.PlotValue("SceneLoad.SpotLightCount", spotLightCount);
-        Profiler.PlotValue("SceneLoad.EnvironmentCount", environmentCount);
-        return new SceneLoadResult(
-            true,
-            document.Entities.Count,
-            cameraCount,
-            meshRendererCount,
-            directionalLightCount,
-            pointLightCount,
-            spotLightCount,
-            environmentCount,
-            $"[SceneAssetLoader] Loaded scene '{sourcePath}' with {document.Entities.Count} entities, {cameraCount} cameras, {meshRendererCount} mesh renderers, {directionalLightCount} directional lights, {pointLightCount} point lights, {spotLightCount} spot lights, and {environmentCount} environments.",
-            string.IsNullOrWhiteSpace(document.Name)
-                ? Path.GetFileNameWithoutExtension(sourcePath)
-                : document.Name.Trim(),
-            sourcePath);
+        for (int i = 0; i < staging.Entities.Length; i++)
+        {
+            Guid parentGuid = staging.Entities[i].ParentGuid;
+            if (parentGuid == Guid.Empty)
+            {
+                continue;
+            }
+
+            if (parentGuid == staging.Entities[i].AuthoringGuid)
+            {
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{staging.DiagnosticPath}' entity '{parentGuid:D}' cannot parent itself.";
+                return false;
+            }
+
+            if (!indices.ContainsKey(parentGuid))
+            {
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{staging.DiagnosticPath}' entity '{staging.Entities[i].AuthoringGuid:D}' references missing local parent '{parentGuid:D}'.";
+                return false;
+            }
+        }
+
+        var states = new byte[staging.Entities.Length];
+        var path = new List<int>();
+        for (int start = 0; start < staging.Entities.Length; start++)
+        {
+            if (states[start] != 0)
+            {
+                continue;
+            }
+
+            path.Clear();
+            int current = start;
+            while (states[current] == 0)
+            {
+                states[current] = 1;
+                path.Add(current);
+                Guid parentGuid = staging.Entities[current].ParentGuid;
+                if (parentGuid == Guid.Empty)
+                {
+                    current = -1;
+                    break;
+                }
+
+                current = indices[parentGuid];
+            }
+
+            if (current >= 0 && states[current] == 1)
+            {
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{staging.DiagnosticPath}' hierarchy contains a cycle at entity '{staging.Entities[current].AuthoringGuid:D}'.";
+                return false;
+            }
+
+            for (int i = 0; i < path.Count; i++)
+            {
+                states[path[i]] = 2;
+            }
+        }
+
+        diagnostic = string.Empty;
+        return true;
     }
 
     public static SceneInspectionResult InspectScene(
@@ -369,6 +746,7 @@ public static class SceneAssetLoader
         {
             return InspectSceneSource(
                 assetDatabase,
+                sceneRef.Guid,
                 sceneAsset.SourcePath,
                 File.ReadAllText(sceneAsset.SourcePath));
         }
@@ -413,11 +791,16 @@ public static class SceneAssetLoader
                 snapshot.SourcePath);
         }
 
-        return InspectSceneSource(assetDatabase, sceneAsset.SourcePath, snapshot.SourceText);
+        return InspectSceneSource(
+            assetDatabase,
+            snapshot.Scene.Guid,
+            sceneAsset.SourcePath,
+            snapshot.SourceText);
     }
 
     private static SceneInspectionResult InspectSceneSource(
         IAssetDatabase assetDatabase,
+        Guid sceneGuid,
         string sourcePath,
         string sourceText)
     {
@@ -434,6 +817,14 @@ public static class SceneAssetLoader
                 document?.Name ?? string.Empty);
         }
 
+        if (document.Version != SceneComponentSchemas.CurrentSceneVersion)
+        {
+            return FailInspection(
+                $"[SceneAssetLoader] Scene '{sourcePath}' schema version '{document.Version}' is not supported.",
+                sourcePath,
+                document.Name ?? string.Empty);
+        }
+
         var diagnostics = new List<string>();
         var entities = new List<SceneEntityInspection>(document.Entities.Count);
         int cameraCount = 0;
@@ -442,6 +833,9 @@ public static class SceneAssetLoader
         int pointLightCount = 0;
         int spotLightCount = 0;
         int environmentCount = 0;
+        var localEntityGuids = document.Entities
+            .Select(entity => entity.Guid)
+            .ToHashSet();
 
         for (int i = 0; i < document.Entities.Count; i++)
         {
@@ -449,6 +843,25 @@ public static class SceneAssetLoader
             string entityName = string.IsNullOrWhiteSpace(sourceEntity.Name)
                 ? $"Entity[{i}]"
                 : sourceEntity.Name.Trim();
+
+            if (sourceEntity.Parent is { } parent)
+            {
+                if (parent.EntityGuid == Guid.Empty)
+                {
+                    diagnostics.Add(
+                        $"[SceneAssetLoader] Scene '{sourcePath}' entity '{sourceEntity.Guid:D}' has a Parent without EntityGuid.");
+                }
+                else if (parent.SceneGuid != Guid.Empty && parent.SceneGuid != sceneGuid)
+                {
+                    diagnostics.Add(
+                        $"[SceneAssetLoader] Scene '{sourcePath}' entity '{sourceEntity.Guid:D}' references parent '{parent.EntityGuid:D}' in external scene '{parent.SceneGuid:D}'. Cross-scene entity references require the future world-reference policy.");
+                }
+                else if (!localEntityGuids.Contains(parent.EntityGuid))
+                {
+                    diagnostics.Add(
+                        $"[SceneAssetLoader] Scene '{sourcePath}' entity '{sourceEntity.Guid:D}' references missing local parent '{parent.EntityGuid:D}'.");
+                }
+            }
 
             var camera = sourceEntity.Camera == null
                 ? null
@@ -504,6 +917,9 @@ public static class SceneAssetLoader
             }
 
             entities.Add(new SceneEntityInspection(
+                sourceEntity.Guid,
+                sourceEntity.Parent?.EntityGuid ?? Guid.Empty,
+                sourceEntity.Parent?.SceneGuid ?? Guid.Empty,
                 entityName,
                 InspectTransform(sourceEntity.Transform),
                 camera,
@@ -531,7 +947,7 @@ public static class SceneAssetLoader
 
     public static SceneAssetEditResult UpdateEntityTransform(
         string sourcePath,
-        int entityIndex,
+        Guid entityGuid,
         SceneTransformInspection transform)
     {
         if (string.IsNullOrWhiteSpace(sourcePath))
@@ -539,9 +955,9 @@ public static class SceneAssetLoader
             return FailEdit("[SceneAssetLoader] Scene source path is empty.");
         }
 
-        if (entityIndex < 0)
+        if (entityGuid == Guid.Empty)
         {
-            return FailEdit($"[SceneAssetLoader] Scene entity index '{entityIndex}' is invalid.");
+            return FailEdit("[SceneAssetLoader] Scene entity GUID is empty.");
         }
 
         if (!File.Exists(sourcePath))
@@ -557,7 +973,7 @@ public static class SceneAssetLoader
                 ? sourceFile.AsSpan(Encoding.UTF8.Preamble.Length)
                 : sourceFile.AsSpan();
             string sourceText = Encoding.UTF8.GetString(sourceBytes);
-            var result = UpdateEntityTransformSource(sourcePath, sourceText, entityIndex, transform);
+            var result = UpdateEntityTransformSource(sourcePath, sourceText, entityGuid, transform);
             if (!result.Success)
             {
                 return result;
@@ -575,7 +991,7 @@ public static class SceneAssetLoader
     public static SceneAssetEditResult UpdateEntityTransformSource(
         string sourcePath,
         string sourceText,
-        int entityIndex,
+        Guid entityGuid,
         SceneTransformInspection transform)
     {
         if (string.IsNullOrWhiteSpace(sourcePath))
@@ -588,9 +1004,9 @@ public static class SceneAssetLoader
             return FailEdit($"[SceneAssetLoader] Scene '{sourcePath}' source text is empty.");
         }
 
-        if (entityIndex < 0)
+        if (entityGuid == Guid.Empty)
         {
-            return FailEdit($"[SceneAssetLoader] Scene entity index '{entityIndex}' is invalid.");
+            return FailEdit("[SceneAssetLoader] Scene entity GUID is empty.");
         }
 
         try
@@ -607,20 +1023,32 @@ public static class SceneAssetLoader
                 return FailEdit($"[SceneAssetLoader] Scene '{sourcePath}' root must be a YAML mapping.");
             }
 
+            if (!SceneComponentSchemas.TryPrepareDocument(root, sourcePath, out var schemaDiagnostic))
+            {
+                return FailEdit(schemaDiagnostic);
+            }
+
             if (!TryGetSequence(root, "Entities", out var entities))
             {
                 return FailEdit($"[SceneAssetLoader] Scene '{sourcePath}' has no Entities sequence.");
             }
 
-            if (entityIndex >= entities.Children.Count)
+            YamlMappingNode? entity = null;
+            for (int i = 0; i < entities.Children.Count; i++)
             {
-                return FailEdit(
-                    $"[SceneAssetLoader] Scene '{sourcePath}' entity index '{entityIndex}' is outside the entity count '{entities.Children.Count}'.");
+                if (entities.Children[i] is YamlMappingNode candidate &&
+                    TryReadGuid(candidate, "Guid", out var candidateGuid) &&
+                    candidateGuid == entityGuid)
+                {
+                    entity = candidate;
+                    break;
+                }
             }
 
-            if (entities.Children[entityIndex] is not YamlMappingNode entity)
+            if (entity == null)
             {
-                return FailEdit($"[SceneAssetLoader] Scene '{sourcePath}' entity index '{entityIndex}' must be a YAML mapping.");
+                return FailEdit(
+                    $"[SceneAssetLoader] Scene '{sourcePath}' does not contain entity GUID '{entityGuid:D}'.");
             }
 
             var transformNode = GetOrCreateMapping(entity, "Transform");
@@ -639,12 +1067,167 @@ public static class SceneAssetLoader
 
             return new SceneAssetEditResult(
                 true,
-                $"[SceneAssetLoader] Updated transform for scene '{sourcePath}' entity index '{entityIndex}'.",
+                $"[SceneAssetLoader] Updated transform for scene '{sourcePath}' entity '{entityGuid:D}'.",
                 updated.ToString());
         }
         catch (Exception ex)
         {
             return FailEdit($"[SceneAssetLoader] Failed to edit scene '{sourcePath}': {ex.Message}");
+        }
+    }
+
+    public static SceneAssetEditResult MigrateLegacySceneSource(
+        Guid sceneGuid,
+        string sourcePath,
+        string sourceText)
+    {
+        if (sceneGuid == Guid.Empty)
+        {
+            return FailEdit("[SceneAssetLoader] Legacy scene migration requires a stable scene GUID.");
+        }
+
+        if (string.IsNullOrWhiteSpace(sourcePath) || string.IsNullOrWhiteSpace(sourceText))
+        {
+            return FailEdit("[SceneAssetLoader] Legacy scene migration requires a source path and source text.");
+        }
+
+        try
+        {
+            var stream = new YamlStream();
+            using (var reader = new StringReader(sourceText))
+            {
+                stream.Load(reader);
+            }
+
+            if (stream.Documents.Count == 0 ||
+                stream.Documents[0].RootNode is not YamlMappingNode root)
+            {
+                return FailEdit($"[SceneAssetLoader] Scene '{sourcePath}' root must be a YAML mapping.");
+            }
+
+            int legacyVersion = 1;
+            if (TryGetChild(root, "Version", out var versionNode) &&
+                (versionNode is not YamlScalarNode versionScalar ||
+                 !int.TryParse(
+                     versionScalar.Value,
+                     NumberStyles.Integer,
+                     CultureInfo.InvariantCulture,
+                     out legacyVersion)))
+            {
+                return FailEdit($"[SceneAssetLoader] Scene '{sourcePath}' has an invalid Version field.");
+            }
+
+            if (legacyVersion != 1)
+            {
+                return FailEdit(
+                    $"[SceneAssetLoader] Scene '{sourcePath}' migration accepts legacy schema version 1, found '{legacyVersion}'.");
+            }
+
+            if (!TryGetSequence(root, "Entities", out var entities) || entities.Children.Count == 0)
+            {
+                return FailEdit($"[SceneAssetLoader] Scene '{sourcePath}' has no entities to migrate.");
+            }
+
+            var usedComponentNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Transform"
+            };
+            var assignedGuids = new HashSet<Guid>();
+            for (int i = 0; i < entities.Children.Count; i++)
+            {
+                if (entities.Children[i] is not YamlMappingNode entity)
+                {
+                    return FailEdit(
+                        $"[SceneAssetLoader] Scene '{sourcePath}' legacy entity {i} must be a mapping.");
+                }
+
+                Guid entityGuid;
+                if (TryReadGuid(entity, "Guid", out var existingGuid) && existingGuid != Guid.Empty)
+                {
+                    entityGuid = existingGuid;
+                }
+                else
+                {
+                    entityGuid = SceneAuthoringIdentity.CreateEntityGuid();
+                    SetChild(entity, "Guid", entityGuid.ToString("D"));
+                }
+
+                if (!assignedGuids.Add(entityGuid))
+                {
+                    return FailEdit(
+                        $"[SceneAssetLoader] Scene '{sourcePath}' legacy entities contain duplicate GUID '{entityGuid:D}'.");
+                }
+
+                foreach (var field in entity.Children)
+                {
+                    if (field.Key is not YamlScalarNode key || string.IsNullOrWhiteSpace(key.Value) ||
+                        string.Equals(key.Value, "Guid", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(key.Value, "Name", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(key.Value, "Parent", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (!SceneComponentSchemas.TryGetByName(key.Value, out var codec))
+                    {
+                        return FailEdit(
+                            $"[SceneAssetLoader] Scene '{sourcePath}' legacy entity {i} contains unsupported component '{key.Value}'.");
+                    }
+
+                    usedComponentNames.Add(codec.Info.Name);
+                }
+            }
+
+            SetChild(root, "Version", SceneComponentSchemas.CurrentSceneVersion.ToString(CultureInfo.InvariantCulture));
+            SetChild(root, "ComponentSchemas", SceneComponentSchemas.CreateCurrentDeclarations(usedComponentNames));
+
+            var updated = new StringBuilder(sourceText.Length + (entities.Children.Count * 64) + 512);
+            using (var writer = new StringWriter(updated, CultureInfo.InvariantCulture)
+            {
+                NewLine = DetectNewline(sourceText)
+            })
+            {
+                stream.Save(writer, assignAnchors: false);
+            }
+
+            return new SceneAssetEditResult(
+                true,
+                $"[SceneAssetLoader] Migrated legacy scene '{sourcePath}' to schema version {SceneComponentSchemas.CurrentSceneVersion} with {assignedGuids.Count} persistent entity GUIDs.",
+                updated.ToString());
+        }
+        catch (Exception ex)
+        {
+            return FailEdit($"[SceneAssetLoader] Failed to migrate legacy scene '{sourcePath}': {ex.Message}");
+        }
+    }
+
+    public static SceneAssetEditResult MigrateLegacySceneFile(Guid sceneGuid, string sourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
+        {
+            return FailEdit($"[SceneAssetLoader] Legacy scene source is missing: {sourcePath}");
+        }
+
+        try
+        {
+            byte[] sourceFile = File.ReadAllBytes(sourcePath);
+            bool hasUtf8Bom = sourceFile.AsSpan().StartsWith(Encoding.UTF8.Preamble);
+            ReadOnlySpan<byte> sourceBytes = hasUtf8Bom
+                ? sourceFile.AsSpan(Encoding.UTF8.Preamble.Length)
+                : sourceFile.AsSpan();
+            string sourceText = new UTF8Encoding(false, true).GetString(sourceBytes);
+            var migration = MigrateLegacySceneSource(sceneGuid, sourcePath, sourceText);
+            if (!migration.Success)
+            {
+                return migration;
+            }
+
+            WriteUtf8Atomically(sourcePath, migration.UpdatedSource, hasUtf8Bom);
+            return migration;
+        }
+        catch (Exception ex)
+        {
+            return FailEdit($"[SceneAssetLoader] Failed to migrate legacy scene '{sourcePath}': {ex.Message}");
         }
     }
 
@@ -697,11 +1280,61 @@ public static class SceneAssetLoader
     {
         try
         {
+            var stream = new YamlStream();
+            using (var reader = new StringReader(sourceText))
+            {
+                stream.Load(reader);
+            }
+
+            if (stream.Documents.Count == 0 ||
+                stream.Documents[0].RootNode is not YamlMappingNode root)
+            {
+                document = null;
+                diagnostic = $"[SceneAssetLoader] Scene '{sourcePath}' root must be a YAML mapping.";
+                return false;
+            }
+
+            if (!SceneComponentSchemas.TryPrepareDocument(root, sourcePath, out diagnostic))
+            {
+                document = null;
+                return false;
+            }
+
+            var preparedSource = new StringBuilder(sourceText.Length + 128);
+            using (var writer = new StringWriter(preparedSource, CultureInfo.InvariantCulture)
+            {
+                NewLine = DetectNewline(sourceText)
+            })
+            {
+                stream.Save(writer, assignAnchors: false);
+            }
+
             var deserializer = new DeserializerBuilder()
                 .WithNamingConvention(PascalCaseNamingConvention.Instance)
                 .IgnoreUnmatchedProperties()
                 .Build();
-            document = deserializer.Deserialize<SceneSourceDocument>(sourceText);
+            document = deserializer.Deserialize<SceneSourceDocument>(preparedSource.ToString());
+            if (document == null)
+            {
+                diagnostic = $"[SceneAssetLoader] Scene '{sourcePath}' deserialized to an empty document.";
+                return false;
+            }
+
+            for (int entityIndex = 0; entityIndex < document.Entities.Count; entityIndex++)
+            {
+                var entity = document.Entities[entityIndex];
+                for (int schemaIndex = 0; schemaIndex < document.ComponentSchemas.Count; schemaIndex++)
+                {
+                    if (SceneComponentSchemas.TryGetByTypeId(
+                            document.ComponentSchemas[schemaIndex].TypeId,
+                            out var codec))
+                    {
+                        object? component = codec.Read(entity);
+                        codec.Write(entity, component);
+                    }
+                }
+            }
+
             diagnostic = string.Empty;
             return true;
         }
@@ -731,6 +1364,13 @@ public static class SceneAssetLoader
         {
             return false;
         }
+    }
+
+    private static string NormalizePackageId(string? packageId)
+    {
+        return string.IsNullOrWhiteSpace(packageId)
+            ? string.Empty
+            : packageId.Trim().ToLowerInvariant();
     }
 
     private static string DetectNewline(string sourceText)
@@ -1196,6 +1836,22 @@ public static class SceneAssetLoader
         return false;
     }
 
+    private static bool TryReadGuid(
+        YamlMappingNode mapping,
+        string key,
+        out Guid guid)
+    {
+        if (TryGetChild(mapping, key, out var node) &&
+            node is YamlScalarNode scalar &&
+            Guid.TryParse(scalar.Value, out guid))
+        {
+            return true;
+        }
+
+        guid = Guid.Empty;
+        return false;
+    }
+
     private static YamlMappingNode GetOrCreateMapping(YamlMappingNode mapping, string key)
     {
         if (TryGetChild(mapping, key, out var existing))
@@ -1269,108 +1925,4 @@ public static class SceneAssetLoader
         return value.ToString("0.########", CultureInfo.InvariantCulture);
     }
 
-    private sealed class SceneSourceDocument
-    {
-        public string Name { get; set; } = string.Empty;
-        public List<SceneEntitySource> Entities { get; set; } = new();
-    }
-
-    private sealed class SceneEntitySource
-    {
-        public string Name { get; set; } = string.Empty;
-        public SceneTransformSource? Transform { get; set; }
-        public SceneCameraSource? Camera { get; set; }
-        public SceneDirectionalLightSource? DirectionalLight { get; set; }
-        public ScenePointLightSource? PointLight { get; set; }
-        public SceneSpotLightSource? SpotLight { get; set; }
-        public SceneEnvironmentSource? Environment { get; set; }
-        public SceneMeshRendererSource? MeshRenderer { get; set; }
-    }
-
-    private sealed class SceneTransformSource
-    {
-        public SceneVector3Source? Position { get; set; }
-        public SceneQuaternionSource? Rotation { get; set; }
-        public SceneVector3Source? Scale { get; set; }
-    }
-
-    private sealed class SceneCameraSource
-    {
-        public float VerticalFov { get; set; } = 60.0f;
-        public float NearPlane { get; set; } = 0.1f;
-        public float FarPlane { get; set; } = 1000.0f;
-        public bool IsPerspective { get; set; } = true;
-    }
-
-    private sealed class SceneMeshRendererSource
-    {
-        public SceneAssetReferenceSource? Mesh { get; set; }
-        public SceneAssetReferenceSource? Material { get; set; }
-        public int FirstSubmeshIndex { get; set; }
-        public int SubmeshCount { get; set; } = -1;
-        public SceneVector3Source? BoundsCenter { get; set; }
-        public SceneVector3Source? BoundsExtents { get; set; }
-        public bool Visible { get; set; } = true;
-    }
-
-    private sealed class SceneDirectionalLightSource
-    {
-        public SceneVector3Source? Direction { get; set; }
-        public SceneVector3Source? Color { get; set; }
-        public float Intensity { get; set; } = 1.0f;
-        public float AmbientIntensity { get; set; } = 0.18f;
-        public bool Enabled { get; set; } = true;
-    }
-
-    private sealed class ScenePointLightSource
-    {
-        public SceneVector3Source? Color { get; set; }
-        public float Intensity { get; set; } = 1.0f;
-        public float Range { get; set; } = 4.0f;
-        public bool Enabled { get; set; } = true;
-    }
-
-    private sealed class SceneSpotLightSource
-    {
-        public SceneVector3Source? Color { get; set; }
-        public float Intensity { get; set; } = 1.0f;
-        public float Range { get; set; } = 4.0f;
-        public float InnerConeAngleDegrees { get; set; } = 18.0f;
-        public float OuterConeAngleDegrees { get; set; } = 28.0f;
-        public bool Enabled { get; set; } = true;
-    }
-
-    private sealed class SceneEnvironmentSource
-    {
-        public SceneAssetReferenceSource? EnvironmentTexture { get; set; }
-        public SceneVector3Source? SkyColor { get; set; }
-        public SceneVector3Source? HorizonColor { get; set; }
-        public SceneVector3Source? GroundColor { get; set; }
-        public SceneVector3Source? AmbientColor { get; set; }
-        public float SkyIntensity { get; set; } = 0.85f;
-        public float AmbientIntensity { get; set; } = 0.32f;
-        public float Exposure { get; set; } = SceneEnvironmentComponent.DefaultExposure;
-        public bool Enabled { get; set; } = true;
-    }
-
-    private sealed class SceneAssetReferenceSource
-    {
-        public Guid Guid { get; set; }
-        public string PackageId { get; set; } = string.Empty;
-    }
-
-    private sealed class SceneVector3Source
-    {
-        public float X { get; set; }
-        public float Y { get; set; }
-        public float Z { get; set; }
-    }
-
-    private sealed class SceneQuaternionSource
-    {
-        public float X { get; set; }
-        public float Y { get; set; }
-        public float Z { get; set; }
-        public float W { get; set; } = 1.0f;
-    }
 }

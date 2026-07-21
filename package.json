@@ -12,12 +12,21 @@
   "services": {
     "provides": [
       "ArisenEngine.Core.Assets.IAssetDatabase",
-      "ArisenEngine.Resources.Serialization.IRuntimeSceneService"
+      "ArisenEngine.Resources.Serialization.IRuntimeSceneService",
+      "ArisenEngine.Resources.Serialization.IRuntimeWorldStreamingService",
+      "ArisenEngine.Resources.Serialization.IRuntimeAssetResidencyService",
+      "ArisenEngine.Resources.Serialization.IWorldOriginService",
+      "ArisenKernel.Lifecycle.IRuntimeSmokeScenarioProvider"
+    ],
+    "requires": [
+      "ArisenEngine.Core.Assets.IRuntimeAssetCookerRegistry",
+      "ArisenEngine.Threading.IBackgroundTaskScheduler"
     ]
   },
   "dependencies": {
     "com.arisen.core": "1.0.0",
     "com.arisen.ecs": "1.0.0",
+    "com.arisen.taskgraph": "1.0.0",
     "com.arisen.core.native": "1.0.0"
   }
 }
