@@ -142,7 +142,7 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         m_Origin.RebaseStarting += OnRebaseStarting;
         m_Origin.Rebased += OnRebased;
 
-        ScheduleVisualCapture("before", initialFrameIndex);
+        ScheduleVisualCapture("before", checked(initialFrameIndex + 1));
         m_Stage = WorldStreamingSmokeStage.AwaitBeforeCapture;
     }
 

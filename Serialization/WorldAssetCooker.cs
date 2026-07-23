@@ -26,7 +26,7 @@ public static class WorldAssetCooker
 {
     public const string RuntimeVariant = "runtime.world.v1";
     public const string CookedExtension = ".ariworld";
-    public const int CookedFormatVersion = 1;
+    public const int CookedFormatVersion = 2;
 
     internal const int HeaderSize = 96;
     internal const int HashOffset = 64;
@@ -226,6 +226,12 @@ public static class WorldAssetCooker
                 WriteSceneReference(writer, cell.Scene);
                 WritePosition(writer, cell.Bounds.Min);
                 WritePosition(writer, cell.Bounds.Max);
+                writer.Write(cell.FocusBounds.HasValue);
+                if (cell.FocusBounds is WorldBounds focusBounds)
+                {
+                    WritePosition(writer, focusBounds.Min);
+                    WritePosition(writer, focusBounds.Max);
+                }
                 writer.Write(cell.SceneContentHash);
                 writer.Write(cell.ScenePayloadBytes);
                 writer.Write(cell.EstimatedCpuBytes);
@@ -370,6 +376,9 @@ public static class WorldAssetCooker
                 string layer = ReadString(reader, stream, diagnosticPath);
                 WorldSceneReference scene = ReadSceneReference(reader, stream, diagnosticPath);
                 var bounds = new WorldBounds(ReadPosition(reader), ReadPosition(reader));
+                WorldBounds? focusBounds = reader.ReadBoolean()
+                    ? new WorldBounds(ReadPosition(reader), ReadPosition(reader))
+                    : null;
                 byte[] sceneHash = ReadExact(reader, stream, HashSize, diagnosticPath);
                 long sceneBytes = reader.ReadInt64();
                 long cpuBytes = reader.ReadInt64();
@@ -399,7 +408,8 @@ public static class WorldAssetCooker
                     cpuBytes,
                     gpuBytes,
                     neighbors,
-                    dependencies);
+                    dependencies,
+                    focusBounds);
             }
 
             var references = new WorldEntityReferenceDescriptor[referenceCount];
@@ -594,6 +604,8 @@ public static class WorldAssetCooker
                 cell.Id != WorldCellIdentity.Create(descriptor.WorldGuid, cell.Key.Coordinate, cell.Key.Layer) ||
                 !layers.Contains(cell.Key.Layer) ||
                 !cell.Bounds.IsValid ||
+                (cell.FocusBounds is WorldBounds focusBounds &&
+                    (!focusBounds.IsValid || !Contains(cell.Bounds, focusBounds))) ||
                 cell.Scene.Guid == Guid.Empty ||
                 !string.Equals(cell.Scene.Variant, SceneAssetCooker.RuntimeVariant, StringComparison.Ordinal) ||
                 cell.SceneContentHash.Length != HashSize ||
@@ -647,6 +659,16 @@ public static class WorldAssetCooker
         }
 
         return true;
+    }
+
+    private static bool Contains(WorldBounds container, WorldBounds candidate)
+    {
+        return candidate.Min.X >= container.Min.X &&
+               candidate.Min.Y >= container.Min.Y &&
+               candidate.Min.Z >= container.Min.Z &&
+               candidate.Max.X <= container.Max.X &&
+               candidate.Max.Y <= container.Max.Y &&
+               candidate.Max.Z <= container.Max.Z;
     }
 
     private static int CompareReferences(
