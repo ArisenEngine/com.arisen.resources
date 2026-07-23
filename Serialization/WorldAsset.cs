@@ -138,7 +138,8 @@ public sealed record WorldCellDescriptor(
     long EstimatedCpuBytes,
     long EstimatedGpuBytes,
     IReadOnlyList<WorldCellId> Neighbors,
-    IReadOnlyList<WorldCellId> Dependencies);
+    IReadOnlyList<WorldCellId> Dependencies,
+    WorldBounds? FocusBounds = null);
 
 public sealed record WorldDescriptor(
     Guid WorldGuid,
@@ -219,7 +220,7 @@ public static class WorldCellIdentity
 
 public static class WorldDescriptorLoader
 {
-    public const int CurrentSourceSchemaVersion = 1;
+    public const int CurrentSourceSchemaVersion = 2;
 
     private const string WorldAssetType = "World";
     private const string SceneAssetType = "Scene";
@@ -287,11 +288,17 @@ public static class WorldDescriptorLoader
                 return Failure(diagnostic);
             }
 
-            if (source!.Version != CurrentSourceSchemaVersion)
+            if (source!.Version is < 1 or > CurrentSourceSchemaVersion)
             {
                 return Failure(
                     $"[WorldDescriptorLoader] World '{diagnosticPath}' schema version " +
-                    $"'{source.Version}' is unsupported; expected '{CurrentSourceSchemaVersion}'.");
+                    $"'{source.Version}' is unsupported; expected 1..{CurrentSourceSchemaVersion}.");
+            }
+
+            if (source.Version < 2 && source.Cells.Any(cell => cell.FocusBounds != null))
+            {
+                return Failure(
+                    $"[WorldDescriptorLoader] World '{diagnosticPath}' FocusBounds requires schema version 2.");
             }
 
             if (source.WorldGuid == Guid.Empty || source.WorldGuid != expectedWorldGuid)
@@ -426,7 +433,7 @@ public static class WorldDescriptorLoader
                 true,
                 new WorldDescriptor(
                     source.WorldGuid,
-                    source.Version,
+                    CurrentSourceSchemaVersion,
                     source.Name.Trim(),
                     persistentScene,
                     Array.Empty<byte>(),
@@ -619,6 +626,28 @@ public static class WorldDescriptorLoader
             return false;
         }
 
+        WorldBounds? focusBounds = null;
+        if (source.FocusBounds != null)
+        {
+            if (source.FocusBounds.Min == null || source.FocusBounds.Max == null)
+            {
+                diagnostic = $"[WorldDescriptorLoader] World '{path}' cell '{id}' FocusBounds requires Min/Max.";
+                return false;
+            }
+
+            var candidate = new WorldBounds(
+                source.FocusBounds.Min.ToPosition(),
+                source.FocusBounds.Max.ToPosition());
+            if (!candidate.IsValid || !Contains(bounds, candidate))
+            {
+                diagnostic =
+                    $"[WorldDescriptorLoader] World '{path}' cell '{id}' FocusBounds must be finite, ordered, and contained by Bounds.";
+                return false;
+            }
+
+            focusBounds = candidate;
+        }
+
         if (source.EstimatedCpuBytes < 0 || source.EstimatedCpuBytes > MaxResidencyEstimate ||
             source.EstimatedGpuBytes < 0 || source.EstimatedGpuBytes > MaxResidencyEstimate)
         {
@@ -636,6 +665,7 @@ public static class WorldDescriptorLoader
             key,
             scene,
             bounds,
+            focusBounds,
             source.EstimatedCpuBytes,
             source.EstimatedGpuBytes,
             source.Dependencies,
@@ -1009,6 +1039,16 @@ public static class WorldDescriptorLoader
                left.Min.Z < right.Max.Z && left.Max.Z > right.Min.Z;
     }
 
+    private static bool Contains(WorldBounds container, WorldBounds candidate)
+    {
+        return candidate.Min.X >= container.Min.X &&
+               candidate.Min.Y >= container.Min.Y &&
+               candidate.Min.Z >= container.Min.Z &&
+               candidate.Max.X <= container.Max.X &&
+               candidate.Max.Y <= container.Max.Y &&
+               candidate.Max.Z <= container.Max.Z;
+    }
+
     private static WorldDescriptorLoadResult Failure(string diagnostic)
     {
         return new WorldDescriptorLoadResult(false, null, diagnostic);
@@ -1026,12 +1066,18 @@ public static class WorldDescriptorLoader
             ValidateMapping(layer, path, "layer", "Id", "Priority"));
         ValidateSequence(root, "Cells", path, "cells", cell =>
         {
-            ValidateMapping(cell, path, "cell", "Coordinate", "Layer", "Scene", "Bounds", "Dependencies", "References", "EstimatedCpuBytes", "EstimatedGpuBytes");
+            ValidateMapping(cell, path, "cell", "Coordinate", "Layer", "Scene", "Bounds", "FocusBounds", "Dependencies", "References", "EstimatedCpuBytes", "EstimatedGpuBytes");
             ValidateChildMapping(cell, "Coordinate", path, "cell coordinate", "X", "Y", "Z");
             ValidateChildMapping(cell, "Scene", path, "cell scene", "Guid", "PackageId");
             ValidateChildMapping(cell, "Bounds", path, "cell bounds", "Min", "Max");
             ValidateNestedVector(cell, "Bounds", "Min", path);
             ValidateNestedVector(cell, "Bounds", "Max", path);
+            if (HasKey(cell, "FocusBounds"))
+            {
+                ValidateChildMapping(cell, "FocusBounds", path, "cell focus bounds", "Min", "Max");
+                ValidateNestedVector(cell, "FocusBounds", "Min", path);
+                ValidateNestedVector(cell, "FocusBounds", "Max", path);
+            }
             ValidateOptionalSequence(cell, "Dependencies", path, "cell dependencies", dependency =>
             {
                 ValidateMapping(dependency, path, "cell dependency", "Coordinate", "Layer");
@@ -1176,6 +1222,7 @@ public static class WorldDescriptorLoader
             WorldCellKey key,
             WorldSceneReference scene,
             WorldBounds bounds,
+            WorldBounds? focusBounds,
             long estimatedCpuBytes,
             long estimatedGpuBytes,
             IReadOnlyList<WorldCellDependencySource> dependencySources,
@@ -1185,6 +1232,7 @@ public static class WorldDescriptorLoader
             Key = key;
             Scene = scene;
             Bounds = bounds;
+            FocusBounds = focusBounds;
             EstimatedCpuBytes = estimatedCpuBytes;
             EstimatedGpuBytes = estimatedGpuBytes;
             DependencySources = dependencySources;
@@ -1195,6 +1243,7 @@ public static class WorldDescriptorLoader
         public WorldCellKey Key { get; }
         public WorldSceneReference Scene { get; }
         public WorldBounds Bounds { get; }
+        public WorldBounds? FocusBounds { get; }
         public long EstimatedCpuBytes { get; }
         public long EstimatedGpuBytes { get; }
         public IReadOnlyList<WorldCellDependencySource> DependencySources { get; }
@@ -1215,7 +1264,8 @@ public static class WorldDescriptorLoader
                 EstimatedCpuBytes,
                 EstimatedGpuBytes,
                 Neighbors.ToArray(),
-                Dependencies.ToArray());
+                Dependencies.ToArray(),
+                FocusBounds);
         }
     }
 
@@ -1273,6 +1323,7 @@ internal sealed class WorldCellSource
     public string Layer { get; set; } = string.Empty;
     public WorldSceneReferenceSource? Scene { get; set; }
     public WorldBoundsSource? Bounds { get; set; }
+    public WorldBoundsSource? FocusBounds { get; set; }
     public List<WorldCellDependencySource> Dependencies { get; set; } = new();
     public List<WorldEntityReferenceSource> References { get; set; } = new();
     public long EstimatedCpuBytes { get; set; }

@@ -133,12 +133,20 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         Unload
     }
 
+    private enum SceneReplacementMode
+    {
+        None,
+        PersistentOnly,
+        All
+    }
+
     private sealed record PendingSceneOperation(
         long Sequence,
         PendingSceneOperationKind OperationKind,
         RuntimeSceneInstanceId InstanceId,
         AssetRef<SceneSourceAsset> Scene,
         SceneSourceSnapshot? Snapshot,
+        SceneReplacementMode ReplacementMode = SceneReplacementMode.None,
         SceneStagingData? PreparedStaging = null,
         string PreparedSourceKind = "");
 
@@ -229,7 +237,7 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             snapshot: null,
             preparedStaging: null,
             preparedSourceKind: string.Empty,
-            replaceExisting: true);
+            SceneReplacementMode.All);
     }
 
     public void RequestSceneLoad(AssetRef<SceneSourceAsset> scene)
@@ -416,7 +424,7 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             snapshot: null,
             staging,
             sourceKind,
-            replaceExisting: false);
+            SceneReplacementMode.None);
         return (instance.InstanceId, result);
     }
 
@@ -490,7 +498,7 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                         operation.Snapshot,
                         operation.PreparedStaging,
                         operation.PreparedSourceKind,
-                        replaceExisting: true);
+                        operation.ReplacementMode);
                     break;
                 case PendingSceneOperationKind.Additive:
                     lastLoadResult = ActivateInstance(
@@ -498,7 +506,7 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                         snapshot: null,
                         operation.PreparedStaging,
                         operation.PreparedSourceKind,
-                        replaceExisting: false);
+                        SceneReplacementMode.None);
                     break;
                 case PendingSceneOperationKind.Unload:
                     UnloadInstance(instance);
@@ -531,6 +539,11 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
     {
         lock (m_Gate)
         {
+            SceneReplacementMode replacementMode =
+                m_ActiveScene is { } activeScene && IsSameScene(activeScene.Scene, scene)
+                    ? SceneReplacementMode.PersistentOnly
+                    : SceneReplacementMode.All;
+
             for (int i = m_PendingOperations.Count - 1; i >= 0; i--)
             {
                 PendingSceneOperation pending = m_PendingOperations[i];
@@ -559,7 +572,8 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 PendingSceneOperationKind.Replace,
                 instance.InstanceId,
                 scene,
-                snapshot));
+                snapshot,
+                replacementMode));
         }
     }
 
@@ -586,7 +600,7 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         SceneSourceSnapshot? snapshot,
         SceneStagingData? preparedStaging,
         string preparedSourceKind,
-        bool replaceExisting)
+        SceneReplacementMode replacementMode)
     {
         using var _ = Profiler.Zone("RuntimeSceneService.LoadScene");
         Entity[] activatedEntities = Array.Empty<Entity>();
@@ -632,8 +646,8 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 return FailActivation(instance, diagnostic);
             }
 
-            RuntimeSceneInstance[] replacedInstances = replaceExisting
-                ? GetActiveInstancesForReplacement(instance.InstanceId)
+            RuntimeSceneInstance[] replacedInstances = replacementMode != SceneReplacementMode.None
+                ? GetActiveInstancesForReplacement(instance.InstanceId, replacementMode)
                 : Array.Empty<RuntimeSceneInstance>();
             if (replacedInstances.Length > 0
                 && !TryValidateUnloadReferences(replacedInstances, out string unloadDiagnostic))
@@ -764,18 +778,29 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
     }
 
     private RuntimeSceneInstance[] GetActiveInstancesForReplacement(
-        RuntimeSceneInstanceId replacementId)
+        RuntimeSceneInstanceId replacementId,
+        SceneReplacementMode replacementMode)
     {
         lock (m_Gate)
         {
             return m_Instances.Values
                 .Where(instance =>
                     instance.InstanceId != replacementId
+                    && (replacementMode == SceneReplacementMode.All
+                        || instance.Kind == RuntimeSceneInstanceKind.Persistent)
                     && (instance.State == RuntimeSceneInstanceState.Active
                         || instance.State == RuntimeSceneInstanceState.QueuedForUnload))
                 .OrderBy(instance => instance.InstanceId.Value)
                 .ToArray();
         }
+    }
+
+    private static bool IsSameScene(
+        AssetRef<SceneSourceAsset> left,
+        AssetRef<SceneSourceAsset> right)
+    {
+        return left.Guid == right.Guid &&
+               string.Equals(left.PackageId, right.PackageId, StringComparison.OrdinalIgnoreCase);
     }
 
     private RuntimeSceneInstanceSnapshot[] DestroyInstances(

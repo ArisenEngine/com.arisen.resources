@@ -21,6 +21,15 @@ public enum WorldCellStreamingState
     Cancelled
 }
 
+[Flags]
+public enum WorldCellDesiredSource
+{
+    None = 0,
+    Runtime = 1 << 0,
+    EditPin = 1 << 1,
+    EditDependency = 1 << 2
+}
+
 public sealed record WorldStreamingBudgets(
     int MaxConcurrentReads,
     long MaxBytesInFlight,
@@ -59,6 +68,7 @@ public sealed record WorldCellStreamingSnapshot(
     long RequestGeneration,
     long TransitionSequence,
     bool Desired,
+    WorldCellDesiredSource DesiredSources,
     bool Pinned,
     bool ReloadRequested,
     RuntimeSceneInstanceId SceneInstanceId,
@@ -613,12 +623,15 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 : default;
 
             var selected = new HashSet<WorldCellId>();
+            var editDesired = new HashSet<WorldCellId>();
+            var runtimeDesired = new HashSet<WorldCellId>();
             var dependencyClosure = new HashSet<WorldCellId>();
             foreach (RuntimeCell pinned in m_Cells.Values
                          .Where(cell => cell.Pinned)
                          .OrderBy(cell => cell.Descriptor.Id))
             {
                 CollectDependencyClosureLocked(pinned, dependencyClosure);
+                editDesired.UnionWith(dependencyClosure);
                 selected.UnionWith(dependencyClosure);
             }
 
@@ -633,7 +646,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                             WorldCellStreamingState.Unloading;
                         int radius = world.Partition.LoadRadius +
                             (activeLike ? world.Partition.UnloadHysteresis : 0);
-                        return !cell.Pinned && ChebyshevDistance(
+                        return ChebyshevDistance(
                             sourceCoordinate,
                             cell.Descriptor.Key.Coordinate) <= radius;
                     })
@@ -656,12 +669,31 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                     }
 
                     selected.UnionWith(dependencyClosure);
+                    runtimeDesired.UnionWith(dependencyClosure);
                 }
             }
 
             foreach (RuntimeCell cell in m_Cells.Values.OrderBy(cell => cell.Descriptor.Id))
             {
-                cell.Desired = selected.Contains(cell.Descriptor.Id);
+                WorldCellDesiredSource desiredSources = WorldCellDesiredSource.None;
+                if (runtimeDesired.Contains(cell.Descriptor.Id))
+                {
+                    desiredSources |= WorldCellDesiredSource.Runtime;
+                }
+                if (cell.Pinned)
+                {
+                    desiredSources |= WorldCellDesiredSource.EditPin;
+                }
+                else if (editDesired.Contains(cell.Descriptor.Id))
+                {
+                    desiredSources |= WorldCellDesiredSource.EditDependency;
+                }
+
+                bool selectionChanged =
+                    cell.DesiredSources != desiredSources ||
+                    cell.Desired != (desiredSources != WorldCellDesiredSource.None);
+                cell.DesiredSources = desiredSources;
+                cell.Desired = desiredSources != WorldCellDesiredSource.None;
                 if (cell.Desired)
                 {
                     if (cell.Diagnostic.StartsWith(
@@ -675,9 +707,14 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                     {
                         changes.Add(TransitionLocked(cell, WorldCellStreamingState.Queued));
                     }
+                    else if (selectionChanged)
+                    {
+                        changes.Add(SnapshotLocked(cell));
+                    }
                     continue;
                 }
 
+                bool transitioned = false;
                 if (cell.Task != null && !cell.Task.IsCompleted)
                 {
                     cell.RequestGeneration++;
@@ -685,6 +722,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                     m_CancellationCount++;
                     cell.Diagnostic = "Cell request was cancelled because it left the desired set.";
                     changes.Add(TransitionLocked(cell, WorldCellStreamingState.Cancelled));
+                    transitioned = true;
                 }
                 else if (cell.State is
                          WorldCellStreamingState.WaitingForResources or
@@ -696,12 +734,19 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                     cell.Diagnostic =
                         "Validated cell staging and residency were discarded because the cell left the desired set.";
                     changes.Add(TransitionLocked(cell, WorldCellStreamingState.Cancelled));
+                    transitioned = true;
                 }
                 else if (cell.State == WorldCellStreamingState.Queued && cell.Task == null)
                 {
                     m_CancellationCount++;
                     cell.Diagnostic = "Queued cell request was cancelled because it left the desired set.";
                     changes.Add(TransitionLocked(cell, WorldCellStreamingState.Cancelled));
+                    transitioned = true;
+                }
+
+                if (selectionChanged && !transitioned)
+                {
+                    changes.Add(SnapshotLocked(cell));
                 }
             }
         }
@@ -1268,6 +1313,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             cell.RequestGeneration,
             cell.TransitionSequence,
             cell.Desired,
+            cell.DesiredSources,
             cell.Pinned,
             cell.ReloadRequested,
             cell.SceneInstanceId,
@@ -1404,6 +1450,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         public long ScheduledGeneration { get; set; }
         public long TransitionSequence { get; set; }
         public bool Desired { get; set; }
+        public WorldCellDesiredSource DesiredSources { get; set; }
         public bool Pinned { get; set; }
         public bool ReloadRequested { get; set; }
         public SceneSourceSnapshot? PreviewSource { get; set; }
