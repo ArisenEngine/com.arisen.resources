@@ -60,7 +60,8 @@ public sealed record RuntimeSceneInstanceSnapshot(
     int EntityCount,
     IReadOnlyList<CookedSceneDependency> Dependencies,
     string Diagnostic,
-    RuntimeSceneComponentCounts ComponentCounts = default);
+    RuntimeSceneComponentCounts ComponentCounts = default,
+    WorldCellId WorldCellId = default);
 
 public sealed record RuntimeSceneDiagnostic(
     long Sequence,
@@ -119,6 +120,8 @@ public interface IRuntimeSceneService
         out Entity entity);
 
     bool TryGetEntityOwner(Entity entity, out RuntimeSceneInstanceId instanceId);
+
+    bool TryGetEntityWorldCellOwner(Entity entity, out WorldCellId cellId);
 }
 
 public sealed class RuntimeSceneService : IRuntimeSceneService
@@ -163,6 +166,9 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         public SceneAuthoringEntityMap? AuthoringEntities { get; set; }
         public CookedSceneDependency[] Dependencies { get; set; } = Array.Empty<CookedSceneDependency>();
         public RuntimeSceneComponentCounts ComponentCounts { get; set; }
+        public WorldCellId WorldCellId { get; init; }
+        public SceneComponentOwnership[] ComponentOwnerships { get; set; } =
+            Array.Empty<SceneComponentOwnership>();
         public string Diagnostic { get; set; } = string.Empty;
 
         public RuntimeSceneInstanceSnapshot Snapshot()
@@ -178,7 +184,8 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 OwnedEntities.Length,
                 Array.AsReadOnly(Dependencies),
                 Diagnostic,
-                ComponentCounts);
+                ComponentCounts,
+                WorldCellId);
         }
     }
 
@@ -188,6 +195,8 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
     private readonly List<PendingSceneOperation> m_PendingOperations = new();
     private readonly Dictionary<long, RuntimeSceneInstance> m_Instances = new();
     private readonly Dictionary<Entity, RuntimeSceneInstanceId> m_EntityOwners = new();
+    private readonly Dictionary<SceneComponentOwnershipKey, RuntimeSceneInstanceId>
+        m_ComponentOwners = new();
     private readonly Queue<RuntimeSceneInstanceSnapshot> m_TerminalSnapshots = new();
     private readonly Queue<RuntimeSceneDiagnostic> m_Diagnostics = new();
     private EntityManager? m_EntityManager;
@@ -396,11 +405,29 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         }
     }
 
+    public bool TryGetEntityWorldCellOwner(Entity entity, out WorldCellId cellId)
+    {
+        lock (m_Gate)
+        {
+            if (m_EntityOwners.TryGetValue(entity, out RuntimeSceneInstanceId instanceId) &&
+                m_Instances.TryGetValue(instanceId.Value, out RuntimeSceneInstance? instance) &&
+                instance.WorldCellId.IsValid)
+            {
+                cellId = instance.WorldCellId;
+                return true;
+            }
+        }
+
+        cellId = default;
+        return false;
+    }
+
     internal (RuntimeSceneInstanceId InstanceId, SceneLoadResult Result)
         ActivatePreparedAdditiveAtFrameBoundary(
             AssetRef<SceneSourceAsset> scene,
             SceneStagingData staging,
-            string sourceKind)
+            string sourceKind,
+            WorldCellId worldCellId)
     {
         ArgumentNullException.ThrowIfNull(staging);
         if (!scene.IsValid || staging.SceneGuid != scene.Guid)
@@ -410,13 +437,21 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 nameof(scene));
         }
 
+        if (!worldCellId.IsValid)
+        {
+            throw new ArgumentException(
+                "Prepared world-cell scene activation requires a valid cell identity.",
+                nameof(worldCellId));
+        }
+
         RuntimeSceneInstance instance;
         lock (m_Gate)
         {
             instance = CreateQueuedInstanceLocked(
                 scene,
                 RuntimeSceneInstanceKind.Additive,
-                sourceRevision: 0);
+                sourceRevision: 0,
+                worldCellId: worldCellId);
         }
 
         SceneLoadResult result = ActivateInstance(
@@ -526,6 +561,7 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             m_PendingOperations.Clear();
             m_Instances.Clear();
             m_EntityOwners.Clear();
+            m_ComponentOwners.Clear();
             m_TerminalSnapshots.Clear();
             m_Diagnostics.Clear();
             m_EntityManager = null;
@@ -580,13 +616,15 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
     private RuntimeSceneInstance CreateQueuedInstanceLocked(
         AssetRef<SceneSourceAsset> scene,
         RuntimeSceneInstanceKind kind,
-        long sourceRevision)
+        long sourceRevision,
+        WorldCellId worldCellId = default)
     {
         var instance = new RuntimeSceneInstance
         {
             InstanceId = new RuntimeSceneInstanceId(++m_NextInstanceId),
             Scene = scene,
             Kind = kind,
+            WorldCellId = worldCellId,
             State = RuntimeSceneInstanceState.QueuedForActivation,
             SourceRevision = sourceRevision,
             Diagnostic = "[RuntimeSceneService] Scene instance is queued for frame-boundary activation."
@@ -655,6 +693,22 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 return FailActivation(instance, unloadDiagnostic);
             }
 
+            if (!SceneStagingValidation.TryCollectExclusiveOwnerships(
+                    staging,
+                    out SceneComponentOwnership[] componentOwnerships,
+                    out string ownershipDiagnostic))
+            {
+                return FailActivation(instance, ownershipDiagnostic);
+            }
+
+            if (!TryValidateComponentOwnerships(
+                    componentOwnerships,
+                    replacedInstances,
+                    out ownershipDiagnostic))
+            {
+                return FailActivation(instance, ownershipDiagnostic);
+            }
+
             EntityManager entityManager = ResolveEntityManager();
             SceneLoadResult result = SceneAssetLoader.InstantiateStagedScene(
                 staging,
@@ -680,6 +734,7 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             instance.AuthoringEntities = authoringEntities;
             instance.Dependencies = SceneAssetCooker.GetDependencies(staging);
             instance.ComponentCounts = RuntimeSceneComponentCounts.From(result);
+            instance.ComponentOwnerships = componentOwnerships;
             instance.Diagnostic = result.Diagnostic;
             instance.State = RuntimeSceneInstanceState.Active;
 
@@ -698,6 +753,11 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 for (int i = 0; i < activatedEntities.Length; i++)
                 {
                     m_EntityOwners.Add(activatedEntities[i], instance.InstanceId);
+                }
+
+                for (int i = 0; i < componentOwnerships.Length; i++)
+                {
+                    m_ComponentOwners.Add(componentOwnerships[i].Key, instance.InstanceId);
                 }
 
                 AddDiagnosticLocked(instance);
@@ -803,6 +863,35 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                string.Equals(left.PackageId, right.PackageId, StringComparison.OrdinalIgnoreCase);
     }
 
+    private bool TryValidateComponentOwnerships(
+        IReadOnlyList<SceneComponentOwnership> ownerships,
+        IReadOnlyList<RuntimeSceneInstance> replacedInstances,
+        out string diagnostic)
+    {
+        var replaced = new HashSet<RuntimeSceneInstanceId>(
+            replacedInstances.Select(candidate => candidate.InstanceId));
+        lock (m_Gate)
+        {
+            for (int i = 0; i < ownerships.Count; i++)
+            {
+                SceneComponentOwnership ownership = ownerships[i];
+                if (!m_ComponentOwners.TryGetValue(ownership.Key, out RuntimeSceneInstanceId owner) ||
+                    replaced.Contains(owner))
+                {
+                    continue;
+                }
+
+                diagnostic =
+                    $"[RuntimeSceneService] Component '{ownership.ComponentName}' exclusive identity " +
+                    $"'{ownership.Key.StableId:D}' is already active in scene instance '{owner}'.";
+                return false;
+            }
+        }
+
+        diagnostic = string.Empty;
+        return true;
+    }
+
     private RuntimeSceneInstanceSnapshot[] DestroyInstances(
         EntityManager entityManager,
         RuntimeSceneInstance[] instances,
@@ -835,6 +924,19 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             for (int i = 0; i < instances.Length; i++)
             {
                 RuntimeSceneInstance instance = instances[i];
+                for (int ownershipIndex = 0;
+                     ownershipIndex < instance.ComponentOwnerships.Length;
+                     ownershipIndex++)
+                {
+                    SceneComponentOwnershipKey key =
+                        instance.ComponentOwnerships[ownershipIndex].Key;
+                    if (m_ComponentOwners.TryGetValue(key, out RuntimeSceneInstanceId owner) &&
+                        owner == instance.InstanceId)
+                    {
+                        m_ComponentOwners.Remove(key);
+                    }
+                }
+
                 instance.State = RuntimeSceneInstanceState.Unloaded;
                 instance.Diagnostic = diagnostic;
                 snapshots[i] = instance.Snapshot();

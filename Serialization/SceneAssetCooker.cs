@@ -20,7 +20,8 @@ public readonly record struct CookedSceneDependency(
     Guid Guid,
     string PackageId,
     string AssetType,
-    bool Required);
+    bool Required,
+    string Variant = "");
 
 internal sealed record SceneStagingData(
     Guid SceneGuid,
@@ -43,7 +44,21 @@ internal readonly record struct SceneStagingEntity(
     PointLightComponent? PointLight,
     SpotLightComponent? SpotLight,
     SceneEnvironmentComponent? Environment,
-    string EnvironmentTexturePackageId);
+    string EnvironmentTexturePackageId,
+    SceneStagedExtensionComponent[]? ExtensionComponents = null);
+
+internal readonly record struct SceneStagedExtensionComponent(
+    ISceneComponentExtensionCodec Codec,
+    object Value);
+
+internal readonly record struct SceneComponentOwnershipKey(
+    uint TypeId,
+    Guid StableId);
+
+internal readonly record struct SceneComponentOwnership(
+    SceneComponentOwnershipKey Key,
+    Guid EntityGuid,
+    string ComponentName);
 
 internal static class SceneStagingValidation
 {
@@ -142,6 +157,85 @@ internal static class SceneStagingValidation
             return false;
         }
 
+        SceneStagedExtensionComponent[] extensions = entity.ExtensionComponents
+            ?? Array.Empty<SceneStagedExtensionComponent>();
+        uint previousTypeId = 0;
+        for (int index = 0; index < extensions.Length; index++)
+        {
+            ISceneComponentExtensionCodec? codec = extensions[index].Codec;
+            object? value = extensions[index].Value;
+            if (codec == null || value == null ||
+                codec.Schema.TypeId <= previousTypeId ||
+                codec.Schema.TypeId < SceneComponentExtensionRegistry.MinimumExtensionTypeId)
+            {
+                diagnostic = Invalid(
+                    diagnosticPath,
+                    entityName,
+                    "extension components are null, duplicated, or not in canonical TypeId order");
+                return false;
+            }
+
+            previousTypeId = codec.Schema.TypeId;
+        }
+
+        diagnostic = string.Empty;
+        return true;
+    }
+
+    public static bool TryCollectExclusiveOwnerships(
+        SceneStagingData staging,
+        out SceneComponentOwnership[] ownerships,
+        out string diagnostic)
+    {
+        var result = new List<SceneComponentOwnership>();
+        var owners = new Dictionary<SceneComponentOwnershipKey, Guid>();
+        for (int entityIndex = 0; entityIndex < staging.Entities.Length; entityIndex++)
+        {
+            ref readonly SceneStagingEntity entity = ref staging.Entities[entityIndex];
+            SceneStagedExtensionComponent[] extensions = entity.ExtensionComponents
+                ?? Array.Empty<SceneStagedExtensionComponent>();
+            for (int componentIndex = 0; componentIndex < extensions.Length; componentIndex++)
+            {
+                ref readonly SceneStagedExtensionComponent extension = ref extensions[componentIndex];
+                Guid stableId;
+                try
+                {
+                    stableId = extension.Codec.GetExclusiveOwnershipId(extension.Value);
+                }
+                catch (Exception ex)
+                {
+                    ownerships = Array.Empty<SceneComponentOwnership>();
+                    diagnostic =
+                        $"[SceneStaging] Scene '{staging.DiagnosticPath}' component " +
+                        $"'{extension.Codec.Schema.Name}' ownership validation failed: {ex.Message}";
+                    return false;
+                }
+
+                if (stableId == Guid.Empty)
+                {
+                    continue;
+                }
+
+                var key = new SceneComponentOwnershipKey(extension.Codec.Schema.TypeId, stableId);
+                if (owners.TryGetValue(key, out Guid existingEntity))
+                {
+                    ownerships = Array.Empty<SceneComponentOwnership>();
+                    diagnostic =
+                        $"[SceneStaging] Scene '{staging.DiagnosticPath}' component " +
+                        $"'{extension.Codec.Schema.Name}' exclusive identity '{stableId:D}' is owned by " +
+                        $"both entities '{existingEntity:D}' and '{entity.AuthoringGuid:D}'.";
+                    return false;
+                }
+
+                owners.Add(key, entity.AuthoringGuid);
+                result.Add(new SceneComponentOwnership(
+                    key,
+                    entity.AuthoringGuid,
+                    extension.Codec.Schema.Name));
+            }
+        }
+
+        ownerships = result.ToArray();
         diagnostic = string.Empty;
         return true;
     }
@@ -196,7 +290,8 @@ internal enum CookedSceneSectionType : uint
     PointLights = 10,
     SpotLights = 11,
     Environments = 12,
-    ComponentSchemas = 13
+    ComponentSchemas = 13,
+    ExtensionComponents = 14
 }
 
 [Flags]
@@ -241,6 +336,12 @@ internal readonly record struct SceneAssetReferenceKey(
     string PackageId,
     bool Required);
 
+internal readonly record struct SceneDependencyKey(
+    Guid Guid,
+    string PackageId,
+    string AssetType,
+    string Variant);
+
 internal readonly record struct CookedSceneSectionPayload(
     CookedSceneSectionType Type,
     CookedSceneSectionFlags Flags,
@@ -251,7 +352,9 @@ internal readonly record struct CookedSceneSectionPayload(
 internal readonly record struct CookedSceneSchemaReadResult(
     SceneComponentSchemaInfo[] Schemas,
     CookedSceneComponentMask DeclaredMask,
-    CookedSceneComponentMask IgnoredMask)
+    CookedSceneComponentMask IgnoredMask,
+    IReadOnlyDictionary<uint, ISceneComponentExtensionCodec> ExtensionCodecs,
+    IReadOnlySet<uint> IgnoredExtensionTypeIds)
 {
     public bool IsSupported(uint typeId)
     {
@@ -264,6 +367,18 @@ internal readonly record struct CookedSceneSchemaReadResult(
         }
 
         return false;
+    }
+
+    public bool TryGetExtensionCodec(
+        uint typeId,
+        out ISceneComponentExtensionCodec codec)
+    {
+        return ExtensionCodecs.TryGetValue(typeId, out codec!);
+    }
+
+    public bool IsIgnoredExtension(uint typeId)
+    {
+        return IgnoredExtensionTypeIds.Contains(typeId);
     }
 }
 
@@ -289,6 +404,8 @@ public static class SceneAssetCooker
     private const int MaxAssetReferenceCount = 3_000_000;
     private const int MaxStringCount = 4_000_000;
     private const int MaxStringByteLength = 1_048_576;
+    private const int MaxExtensionComponentCount = 4_000_000;
+    private const int MaxExtensionPayloadBytes = 1_048_576;
     private const int MaxCookedSceneBytes = 512 * 1024 * 1024;
 
     private const uint MetadataStride = 8;
@@ -506,6 +623,7 @@ public static class SceneAssetCooker
         }
 
         ValidateComponentSchemas(staging.ComponentSchemas);
+        ValidateExtensionSchemaUsage(staging);
 
         for (int i = 0; i < staging.Entities.Length; i++)
         {
@@ -545,7 +663,7 @@ public static class SceneAssetCooker
             stringIndices.Add(strings[i], checked((uint)i));
         }
 
-        var sections = new[]
+        var sections = new List<CookedSceneSectionPayload>
         {
             new CookedSceneSectionPayload(
                 CookedSceneSectionType.Metadata,
@@ -597,10 +715,16 @@ public static class SceneAssetCooker
                 BuildComponentSchemasSection(staging.ComponentSchemas))
         };
 
-        int directorySize = checked(sections.Length * SectionDirectoryEntrySize);
+        CookedSceneSectionPayload extensionSection = BuildExtensionComponentsSection(staging);
+        if (extensionSection.Count > 0)
+        {
+            sections.Add(extensionSection);
+        }
+
+        int directorySize = checked(sections.Count * SectionDirectoryEntrySize);
         int nextOffset = Align8(checked(HeaderSize + directorySize));
-        var descriptors = new CookedSceneSectionDescriptor[sections.Length];
-        for (int i = 0; i < sections.Length; i++)
+        var descriptors = new CookedSceneSectionDescriptor[sections.Count];
+        for (int i = 0; i < sections.Count; i++)
         {
             byte[] sectionBytes = sections[i].Bytes;
             descriptors[i] = new CookedSceneSectionDescriptor(
@@ -626,7 +750,7 @@ public static class SceneAssetCooker
         BinaryPrimitives.WriteUInt32LittleEndian(outputSpan.Slice(12, 4), EndianMarker);
         WriteGuid(outputSpan.Slice(16, 16), staging.SceneGuid);
         BinaryPrimitives.WriteInt32LittleEndian(outputSpan.Slice(32, 4), staging.SourceSchemaVersion);
-        BinaryPrimitives.WriteInt32LittleEndian(outputSpan.Slice(36, 4), sections.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(outputSpan.Slice(36, 4), sections.Count);
         BinaryPrimitives.WriteUInt64LittleEndian(outputSpan.Slice(40, 8), checked((ulong)output.Length));
 
         for (int i = 0; i < descriptors.Length; i++)
@@ -954,6 +1078,17 @@ public static class SceneAssetCooker
                 EnvironmentStride),
             entities,
             assetReferences);
+        ReadExtensionComponents(
+            assetDatabase,
+            sceneGuid,
+            diagnosticPath,
+            bytes,
+            GetOptionalVariableSection(
+                knownSections,
+                CookedSceneSectionType.ExtensionComponents,
+                MaxExtensionComponentCount),
+            componentSchemas,
+            entities);
 
         var stagedEntities = new SceneStagingEntity[entities.Length];
         for (int i = 0; i < entities.Length; i++)
@@ -979,6 +1114,14 @@ public static class SceneAssetCooker
         if (!SceneAssetLoader.TryValidateStagedHierarchy(staged, out var hierarchyDiagnostic))
         {
             throw Invalid(hierarchyDiagnostic);
+        }
+
+        if (!SceneStagingValidation.TryCollectExclusiveOwnerships(
+                staged,
+                out _,
+                out string ownershipDiagnostic))
+        {
+            throw Invalid(ownershipDiagnostic);
         }
 
         return staged;
@@ -1036,13 +1179,87 @@ public static class SceneAssetCooker
 
     internal static CookedSceneDependency[] GetDependencies(SceneStagingData staging)
     {
-        return BuildAssetReferences(staging)
-            .Select(reference => new CookedSceneDependency(
+        var dependencies = new Dictionary<SceneDependencyKey, CookedSceneDependency>();
+        foreach (SceneAssetReferenceKey reference in BuildAssetReferences(staging))
+        {
+            AddDependency(
+                dependencies,
+                new CookedSceneDependency(
                 reference.Guid,
                 reference.PackageId,
                 GetAssetType(reference.Kind),
-                reference.Required))
+                reference.Required));
+        }
+
+        foreach (ref readonly SceneStagingEntity entity in staging.Entities.AsSpan())
+        {
+            SceneStagedExtensionComponent[] extensions = entity.ExtensionComponents
+                ?? Array.Empty<SceneStagedExtensionComponent>();
+            for (int componentIndex = 0; componentIndex < extensions.Length; componentIndex++)
+            {
+                ref readonly SceneStagedExtensionComponent extension = ref extensions[componentIndex];
+                IReadOnlyList<CookedSceneDependency> extensionDependencies =
+                    extension.Codec.GetDependencies(extension.Value)
+                    ?? throw new InvalidOperationException(
+                        $"[SceneAssetCooker] Extension '{extension.Codec.Schema.Name}' returned null dependencies.");
+                for (int dependencyIndex = 0;
+                     dependencyIndex < extensionDependencies.Count;
+                     dependencyIndex++)
+                {
+                    CookedSceneDependency dependency = extensionDependencies[dependencyIndex];
+                    if (dependency.Guid == Guid.Empty ||
+                        string.IsNullOrWhiteSpace(dependency.PackageId) ||
+                        string.IsNullOrWhiteSpace(dependency.AssetType) ||
+                        !string.Equals(
+                            dependency.PackageId,
+                            dependency.PackageId.Trim(),
+                            StringComparison.Ordinal) ||
+                        !string.Equals(
+                            dependency.AssetType,
+                            dependency.AssetType.Trim(),
+                            StringComparison.Ordinal) ||
+                        !string.Equals(
+                            dependency.Variant,
+                            dependency.Variant.Trim(),
+                            StringComparison.Ordinal))
+                    {
+                        throw new InvalidOperationException(
+                            $"[SceneAssetCooker] Extension '{extension.Codec.Schema.Name}' returned " +
+                            $"an invalid dependency at index {dependencyIndex}.");
+                    }
+
+                    AddDependency(dependencies, dependency);
+                }
+            }
+        }
+
+        return dependencies.Values
+            .OrderBy(dependency => dependency.Guid)
+            .ThenBy(dependency => dependency.PackageId, StringComparer.Ordinal)
+            .ThenBy(dependency => dependency.AssetType, StringComparer.Ordinal)
+            .ThenBy(dependency => dependency.Variant, StringComparer.Ordinal)
             .ToArray();
+    }
+
+    private static void AddDependency(
+        IDictionary<SceneDependencyKey, CookedSceneDependency> dependencies,
+        CookedSceneDependency dependency)
+    {
+        var key = new SceneDependencyKey(
+            dependency.Guid,
+            dependency.PackageId,
+            dependency.AssetType,
+            dependency.Variant);
+        if (dependencies.TryGetValue(key, out CookedSceneDependency existing))
+        {
+            if (dependency.Required && !existing.Required)
+            {
+                dependencies[key] = existing with { Required = true };
+            }
+            return;
+        }
+
+        dependencies.Add(key, dependency);
     }
 
     private static int CompareAssetReferences(SceneAssetReferenceKey left, SceneAssetReferenceKey right)
@@ -1177,6 +1394,53 @@ public static class SceneAssetCooker
         }
 
         return writer.ToArray();
+    }
+
+    private static CookedSceneSectionPayload BuildExtensionComponentsSection(
+        SceneStagingData staging)
+    {
+        using var writer = new ScenePayloadWriter();
+        int componentCount = 0;
+        for (int entityIndex = 0; entityIndex < staging.Entities.Length; entityIndex++)
+        {
+            SceneStagedExtensionComponent[] extensions =
+                staging.Entities[entityIndex].ExtensionComponents
+                ?? Array.Empty<SceneStagedExtensionComponent>();
+            for (int componentIndex = 0; componentIndex < extensions.Length; componentIndex++)
+            {
+                ref readonly SceneStagedExtensionComponent extension = ref extensions[componentIndex];
+                byte[] payload = extension.Codec.WriteCooked(extension.Value)
+                    ?? throw new InvalidOperationException(
+                        $"[SceneAssetCooker] Extension '{extension.Codec.Schema.Name}' returned a null cooked payload.");
+                if (payload.Length > MaxExtensionPayloadBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"[SceneAssetCooker] Extension '{extension.Codec.Schema.Name}' payload size " +
+                        $"'{payload.Length}' exceeds {MaxExtensionPayloadBytes} bytes.");
+                }
+
+                writer.WriteUInt32(checked((uint)entityIndex));
+                writer.WriteUInt32(extension.Codec.Schema.TypeId);
+                writer.WriteUInt32(checked((uint)payload.Length));
+                writer.WriteUInt32(0);
+                writer.WriteBytes(payload);
+                writer.WriteZeroPaddingTo8();
+                componentCount = checked(componentCount + 1);
+                if (componentCount > MaxExtensionComponentCount)
+                {
+                    throw new InvalidOperationException(
+                        $"[SceneAssetCooker] Extension component count exceeds " +
+                        $"{MaxExtensionComponentCount}.");
+                }
+            }
+        }
+
+        return new CookedSceneSectionPayload(
+            CookedSceneSectionType.ExtensionComponents,
+            CookedSceneSectionFlags.None,
+            checked((uint)componentCount),
+            0,
+            writer.ToArray());
     }
 
     private static byte[] BuildAssetReferencesSection(
@@ -1563,6 +1827,8 @@ public static class SceneAssetCooker
         uint previousTypeId = 0;
         var declaredMask = CookedSceneComponentMask.None;
         var ignoredMask = CookedSceneComponentMask.None;
+        var extensionCodecs = new Dictionary<uint, ISceneComponentExtensionCodec>();
+        var ignoredExtensionTypeIds = new HashSet<uint>();
         bool hasRequiredTransform = false;
         for (int i = 0; i < descriptor.Count; i++)
         {
@@ -1584,6 +1850,11 @@ public static class SceneAssetCooker
                     throw Invalid($"required component TypeId '{typeId}' is unknown");
                 }
 
+                if (rawSectionType == (uint)CookedSceneSectionType.ExtensionComponents)
+                {
+                    ignoredExtensionTypeIds.Add(typeId);
+                }
+
                 previousTypeId = typeId;
                 continue;
             }
@@ -1603,7 +1874,14 @@ public static class SceneAssetCooker
                         $"required component '{codec.Info.Name}' version '{rawVersion}' is newer than supported version '{codec.Info.Version}'");
                 }
 
-                ignoredMask |= mask;
+                if (codec.Extension != null)
+                {
+                    ignoredExtensionTypeIds.Add(typeId);
+                }
+                else
+                {
+                    ignoredMask |= mask;
+                }
                 previousTypeId = typeId;
                 continue;
             }
@@ -1620,7 +1898,14 @@ public static class SceneAssetCooker
                 checked((int)rawVersion),
                 required);
             supported.Add(schema);
-            declaredMask |= mask;
+            if (codec.Extension != null)
+            {
+                extensionCodecs.Add(typeId, codec.Extension);
+            }
+            else
+            {
+                declaredMask |= mask;
+            }
             hasRequiredTransform |= typeId == SceneComponentSchemas.TransformTypeId && required;
             previousTypeId = typeId;
         }
@@ -1634,7 +1919,9 @@ public static class SceneAssetCooker
         return new CookedSceneSchemaReadResult(
             supported.ToArray(),
             declaredMask,
-            ignoredMask);
+            ignoredMask,
+            extensionCodecs,
+            ignoredExtensionTypeIds);
     }
 
     private static SceneEntityBuilder[] ReadEntities(
@@ -1979,6 +2266,92 @@ public static class SceneAssetCooker
         reader.EnsureEnd("Environment component stream");
     }
 
+    private static void ReadExtensionComponents(
+        IAssetDatabase assetDatabase,
+        Guid sceneGuid,
+        string diagnosticPath,
+        ReadOnlySpan<byte> fileBytes,
+        CookedSceneSectionDescriptor? descriptor,
+        CookedSceneSchemaReadResult schemas,
+        SceneEntityBuilder[] entities)
+    {
+        if (descriptor == null)
+        {
+            return;
+        }
+
+        var reader = new ScenePayloadReader(GetSection(fileBytes, descriptor.Value));
+        int previousEntityIndex = -1;
+        uint previousTypeId = 0;
+        for (uint recordIndex = 0; recordIndex < descriptor.Value.Count; recordIndex++)
+        {
+            uint rawEntityIndex = reader.ReadUInt32();
+            uint typeId = reader.ReadUInt32();
+            uint rawPayloadSize = reader.ReadUInt32();
+            uint reserved = reader.ReadUInt32();
+            if (rawEntityIndex >= (uint)entities.Length ||
+                typeId < SceneComponentExtensionRegistry.MinimumExtensionTypeId ||
+                rawPayloadSize > MaxExtensionPayloadBytes ||
+                reserved != 0)
+            {
+                throw Invalid(
+                    $"extension component record {recordIndex} has invalid entity, type, size, or reserved data");
+            }
+
+            int entityIndex = checked((int)rawEntityIndex);
+            if (entityIndex < previousEntityIndex ||
+                (entityIndex == previousEntityIndex && typeId <= previousTypeId))
+            {
+                throw Invalid("extension component records are not in canonical entity/TypeId order");
+            }
+
+            previousEntityIndex = entityIndex;
+            previousTypeId = typeId;
+            ReadOnlySpan<byte> payload = reader.ReadBytes(checked((int)rawPayloadSize));
+            reader.ReadZeroPaddingTo8("extension component record padding");
+
+            if (schemas.TryGetExtensionCodec(typeId, out var codec))
+            {
+                var context = new SceneComponentReadContext(
+                    assetDatabase,
+                    sceneGuid,
+                    entities[entityIndex].AuthoringGuid,
+                    diagnosticPath);
+                try
+                {
+                    if (!codec.TryReadCooked(
+                            context,
+                            payload,
+                            out object component,
+                            out string diagnostic))
+                    {
+                        throw Invalid(diagnostic);
+                    }
+
+                    if (component == null)
+                    {
+                        throw Invalid(
+                            $"extension '{codec.Schema.Name}' returned null cooked staging data");
+                    }
+
+                    entities[entityIndex].AddExtension(codec, component);
+                }
+                catch (Exception ex) when (ex is not InvalidDataException)
+                {
+                    throw Invalid(
+                        $"extension '{codec.Schema.Name}' payload failed validation: {ex.Message}");
+                }
+            }
+            else if (!schemas.IsIgnoredExtension(typeId))
+            {
+                throw Invalid(
+                    $"extension component TypeId '{typeId}' has no matching schema declaration");
+            }
+        }
+
+        reader.EnsureEnd("extension component stream");
+    }
+
     private static byte ReadBooleanByte(ref ScenePayloadReader reader, string field, int entityIndex)
     {
         uint value = reader.ReadUInt32();
@@ -2093,6 +2466,26 @@ public static class SceneAssetCooker
         if (descriptor.Count > (uint)maximumCount)
         {
             throw Invalid($"section '{type}' count '{descriptor.Count}' exceeds '{maximumCount}'");
+        }
+
+        return descriptor;
+    }
+
+    private static CookedSceneSectionDescriptor? GetOptionalVariableSection(
+        IReadOnlyDictionary<CookedSceneSectionType, CookedSceneSectionDescriptor> sections,
+        CookedSceneSectionType type,
+        int maximumCount)
+    {
+        if (!sections.TryGetValue(type, out var descriptor))
+        {
+            return null;
+        }
+
+        if ((descriptor.Flags & CookedSceneSectionFlags.Required) != 0 ||
+            descriptor.Stride != 0 ||
+            descriptor.Count > (uint)maximumCount)
+        {
+            throw Invalid($"optional variable section '{type}' has invalid flags, stride, or count");
         }
 
         return descriptor;
@@ -2290,9 +2683,32 @@ public static class SceneAssetCooker
         }
     }
 
+    private static void ValidateExtensionSchemaUsage(SceneStagingData staging)
+    {
+        var declared = staging.ComponentSchemas
+            .Select(schema => schema.TypeId)
+            .ToHashSet();
+        for (int entityIndex = 0; entityIndex < staging.Entities.Length; entityIndex++)
+        {
+            SceneStagedExtensionComponent[] extensions =
+                staging.Entities[entityIndex].ExtensionComponents
+                ?? Array.Empty<SceneStagedExtensionComponent>();
+            for (int componentIndex = 0; componentIndex < extensions.Length; componentIndex++)
+            {
+                uint typeId = extensions[componentIndex].Codec.Schema.TypeId;
+                if (!declared.Contains(typeId))
+                {
+                    throw new InvalidOperationException(
+                        $"[SceneAssetCooker] Entity {entityIndex} extension TypeId '{typeId}' " +
+                        "has no component schema declaration.");
+                }
+            }
+        }
+    }
+
     private static CookedSceneSectionType GetComponentSectionType(uint typeId)
     {
-        return typeId switch
+        CookedSceneSectionType builtIn = typeId switch
         {
             SceneComponentSchemas.TransformTypeId => CookedSceneSectionType.Transforms,
             SceneComponentSchemas.CameraTypeId => CookedSceneSectionType.Cameras,
@@ -2301,8 +2717,21 @@ public static class SceneAssetCooker
             SceneComponentSchemas.PointLightTypeId => CookedSceneSectionType.PointLights,
             SceneComponentSchemas.SpotLightTypeId => CookedSceneSectionType.SpotLights,
             SceneComponentSchemas.EnvironmentTypeId => CookedSceneSectionType.Environments,
-            _ => throw Invalid($"component TypeId '{typeId}' has no cooked section")
+            _ => default
         };
+
+        if (builtIn != default)
+        {
+            return builtIn;
+        }
+
+        if (SceneComponentSchemas.TryGetByTypeId(typeId, out var codec) &&
+            codec.Extension != null)
+        {
+            return CookedSceneSectionType.ExtensionComponents;
+        }
+
+        throw Invalid($"component TypeId '{typeId}' has no cooked section");
     }
 
     private static CookedSceneComponentMask GetComponentMask(uint typeId)
@@ -2398,6 +2827,19 @@ public static class SceneAssetCooker
         public SpotLightComponent? SpotLight { get; set; }
         public SceneEnvironmentComponent? Environment { get; set; }
         public string EnvironmentTexturePackageId { get; set; } = string.Empty;
+        public List<SceneStagedExtensionComponent> ExtensionComponents { get; } = new();
+
+        public void AddExtension(ISceneComponentExtensionCodec codec, object component)
+        {
+            if (ExtensionComponents.Count > 0 &&
+                ExtensionComponents[^1].Codec.Schema.TypeId >= codec.Schema.TypeId)
+            {
+                throw Invalid(
+                    $"entity extension '{codec.Schema.Name}' is duplicated or noncanonical");
+            }
+
+            ExtensionComponents.Add(new SceneStagedExtensionComponent(codec, component));
+        }
 
         public SceneStagingEntity Build(int entityIndex)
         {
@@ -2426,7 +2868,8 @@ public static class SceneAssetCooker
                 PointLight,
                 SpotLight,
                 Environment,
-                EnvironmentTexturePackageId);
+                EnvironmentTexturePackageId,
+                ExtensionComponents.ToArray());
         }
 
         private void VerifyMask(
@@ -2492,6 +2935,16 @@ public static class SceneAssetCooker
             m_Stream.Write(bytes);
         }
 
+        public void WriteZeroPaddingTo8()
+        {
+            int padding = checked((int)((8 - (m_Stream.Position & 7)) & 7));
+            if (padding > 0)
+            {
+                Span<byte> zeros = stackalloc byte[8];
+                m_Stream.Write(zeros[..padding]);
+            }
+        }
+
         public byte[] ToArray()
         {
             return m_Stream.ToArray();
@@ -2554,6 +3007,19 @@ public static class SceneAssetCooker
             ReadOnlySpan<byte> result = m_Bytes.Slice(m_Offset, count);
             m_Offset += count;
             return result;
+        }
+
+        public void ReadZeroPaddingTo8(string field)
+        {
+            int padding = (8 - (m_Offset & 7)) & 7;
+            ReadOnlySpan<byte> bytes = ReadBytes(padding);
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                if (bytes[i] != 0)
+                {
+                    throw Invalid($"{field} contains nonzero data");
+                }
+            }
         }
 
         public void EnsureEnd(string sectionName)

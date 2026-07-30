@@ -1,5 +1,6 @@
 using System.Globalization;
 using YamlDotNet.RepresentationModel;
+using YamlDotNet.Serialization;
 
 namespace ArisenEngine.Resources.Serialization;
 
@@ -57,12 +58,10 @@ public static class SceneComponentSchemas
             (entity, value) => entity.Environment = (SceneEnvironmentSource?)value)
     ];
 
-    private static readonly SceneComponentSchemaInfo[] s_Supported =
-        s_Codecs.Select(codec => codec.Info).ToArray();
+    public static IReadOnlyList<SceneComponentSchemaInfo> Supported =>
+        GetCodecs().Select(codec => codec.Info).ToArray();
 
-    public static IReadOnlyList<SceneComponentSchemaInfo> Supported => s_Supported;
-
-    internal static IReadOnlyList<SceneComponentCodec> Codecs => s_Codecs;
+    internal static IReadOnlyList<SceneComponentCodec> Codecs => GetCodecs();
 
     internal static bool TryGetByTypeId(uint typeId, out SceneComponentCodec codec)
     {
@@ -73,6 +72,12 @@ public static class SceneComponentSchemas
                 codec = s_Codecs[i];
                 return true;
             }
+        }
+
+        if (SceneComponentExtensionRegistry.Shared.TryGetByTypeId(typeId, out var extension))
+        {
+            codec = new SceneComponentCodec(extension);
+            return true;
         }
 
         codec = null!;
@@ -88,6 +93,12 @@ public static class SceneComponentSchemas
                 codec = s_Codecs[i];
                 return true;
             }
+        }
+
+        if (SceneComponentExtensionRegistry.Shared.TryGetByName(name, out var extension))
+        {
+            codec = new SceneComponentCodec(extension);
+            return true;
         }
 
         codec = null!;
@@ -304,9 +315,10 @@ public static class SceneComponentSchemas
         IReadOnlySet<string> componentNames)
     {
         var declarations = new YamlSequenceNode();
-        for (int i = 0; i < s_Codecs.Length; i++)
+        IReadOnlyList<SceneComponentCodec> codecs = Codecs;
+        for (int i = 0; i < codecs.Count; i++)
         {
-            var codec = s_Codecs[i];
+            var codec = codecs[i];
             if (codec.Info.TypeId != TransformTypeId && !componentNames.Contains(codec.Info.Name))
             {
                 continue;
@@ -322,6 +334,26 @@ public static class SceneComponentSchemas
         }
 
         return declarations;
+    }
+
+    private static SceneComponentCodec[] GetCodecs()
+    {
+        ISceneComponentExtensionCodec[] extensions =
+            SceneComponentExtensionRegistry.Shared.GetCodecs();
+        if (extensions.Length == 0)
+        {
+            return s_Codecs;
+        }
+
+        var codecs = new SceneComponentCodec[s_Codecs.Length + extensions.Length];
+        Array.Copy(s_Codecs, codecs, s_Codecs.Length);
+        for (int i = 0; i < extensions.Length; i++)
+        {
+            codecs[s_Codecs.Length + i] = new SceneComponentCodec(extensions[i]);
+        }
+
+        Array.Sort(codecs, static (left, right) => left.Info.TypeId.CompareTo(right.Info.TypeId));
+        return codecs;
     }
 
     internal static bool TryGetChild(
@@ -505,10 +537,20 @@ internal sealed class SceneComponentCodec
         Migrations = migrations ?? new Dictionary<int, Action<YamlMappingNode>>();
     }
 
+    public SceneComponentCodec(ISceneComponentExtensionCodec extension)
+    {
+        Extension = extension ?? throw new ArgumentNullException(nameof(extension));
+        Info = extension.Schema;
+        Read = _ => null;
+        Write = static (_, _) => { };
+        Migrations = new Dictionary<int, Action<YamlMappingNode>>();
+    }
+
     public SceneComponentSchemaInfo Info { get; }
     public Func<SceneEntitySource, object?> Read { get; }
     public Action<SceneEntitySource, object?> Write { get; }
     public IReadOnlyDictionary<int, Action<YamlMappingNode>> Migrations { get; }
+    public ISceneComponentExtensionCodec? Extension { get; }
 }
 
 internal sealed class SceneSourceDocument
@@ -539,6 +581,9 @@ internal sealed class SceneEntitySource
     public SceneSpotLightSource? SpotLight { get; set; }
     public SceneEnvironmentSource? Environment { get; set; }
     public SceneMeshRendererSource? MeshRenderer { get; set; }
+
+    [YamlIgnore]
+    public Dictionary<uint, YamlMappingNode> ExtensionComponents { get; } = new();
 }
 
 internal sealed class SceneParentReferenceSource

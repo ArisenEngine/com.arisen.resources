@@ -15,6 +15,8 @@ public class ResourcesPackage : IPackageEntry
     private RuntimeWorldStreamingService? m_RuntimeWorldStreamingService;
     private RuntimeAssetResidencyService? m_RuntimeAssetResidencyService;
     private WorldOriginService? m_WorldOriginService;
+    private RuntimeSmokeScenarioRegistry? m_SmokeScenarioRegistry;
+    private WorldStreamingSmokeScenarioProvider? m_WorldStreamingSmokeProvider;
 
     public void OnLoad(IServiceRegistry registry)
     {
@@ -49,6 +51,9 @@ public class ResourcesPackage : IPackageEntry
         database.InitializeWorkspace(workspaceRoot, packages, sourceAccessMode);
 #endif
         registry.RegisterService<IAssetDatabase>(database);
+        registry.RegisterService<IAssetSourceIndex>(database);
+        registry.RegisterService<ISceneComponentExtensionRegistry>(
+            SceneComponentExtensionRegistry.Shared);
         IRuntimeAssetCookerRegistry cookerRegistry = registry.GetService<IRuntimeAssetCookerRegistry>();
         cookerRegistry.RegisterCooker(new SceneRuntimeAssetCooker(database));
         cookerRegistry.RegisterCooker(new WorldRuntimeAssetCooker(database));
@@ -70,14 +75,17 @@ public class ResourcesPackage : IPackageEntry
             residencyService: m_RuntimeAssetResidencyService,
             originService: m_WorldOriginService);
         registry.RegisterService<IRuntimeWorldStreamingService>(m_RuntimeWorldStreamingService);
-        registry.RegisterService<IRuntimeSmokeScenarioProvider>(
-            new WorldStreamingSmokeScenarioProvider(
-                m_RuntimeWorldStreamingService,
-                m_RuntimeSceneService,
-                m_RuntimeAssetResidencyService,
-                m_WorldOriginService,
-                database,
-                registry.GetService<IBackgroundTaskScheduler>()));
+        m_SmokeScenarioRegistry = new RuntimeSmokeScenarioRegistry();
+        m_WorldStreamingSmokeProvider = new WorldStreamingSmokeScenarioProvider(
+            m_RuntimeWorldStreamingService,
+            m_RuntimeSceneService,
+            m_RuntimeAssetResidencyService,
+            m_WorldOriginService,
+            database,
+            registry.GetService<IBackgroundTaskScheduler>());
+        m_SmokeScenarioRegistry.Register("world-streaming", m_WorldStreamingSmokeProvider);
+        registry.RegisterService<IRuntimeSmokeScenarioRegistry>(m_SmokeScenarioRegistry);
+        registry.RegisterService<IRuntimeSmokeScenarioProvider>(m_SmokeScenarioRegistry);
         EngineKernel.Instance.OnFrameEnd += ProcessPendingSceneLoad;
 
         KernelLog.InfoFormat(
@@ -108,6 +116,12 @@ public class ResourcesPackage : IPackageEntry
     public void OnUnload(IServiceRegistry registry)
     {
         EngineKernel.Instance.OnFrameEnd -= ProcessPendingSceneLoad;
+        if (m_SmokeScenarioRegistry != null && m_WorldStreamingSmokeProvider != null)
+        {
+            m_SmokeScenarioRegistry.Unregister(
+                "world-streaming",
+                m_WorldStreamingSmokeProvider);
+        }
         m_RuntimeWorldStreamingService?.Shutdown(unloadActiveCells: false);
         m_RuntimeSceneService?.ClearForShutdown();
         m_RuntimeAssetResidencyService?.Dispose();
@@ -116,6 +130,8 @@ public class ResourcesPackage : IPackageEntry
         m_RuntimeSceneService = null;
         m_RuntimeAssetResidencyService = null;
         m_WorldOriginService = null;
+        m_WorldStreamingSmokeProvider = null;
+        m_SmokeScenarioRegistry = null;
     }
 
     private void ProcessPendingSceneLoad()

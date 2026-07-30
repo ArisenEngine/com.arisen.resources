@@ -12,10 +12,13 @@
   "services": {
     "provides": [
       "ArisenEngine.Core.Assets.IAssetDatabase",
+      "ArisenEngine.Core.Assets.IAssetSourceIndex",
+      "ArisenEngine.Resources.Serialization.ISceneComponentExtensionRegistry",
       "ArisenEngine.Resources.Serialization.IRuntimeSceneService",
       "ArisenEngine.Resources.Serialization.IRuntimeWorldStreamingService",
       "ArisenEngine.Resources.Serialization.IRuntimeAssetResidencyService",
       "ArisenEngine.Resources.Serialization.IWorldOriginService",
+      "ArisenKernel.Lifecycle.IRuntimeSmokeScenarioRegistry",
       "ArisenKernel.Lifecycle.IRuntimeSmokeScenarioProvider"
     ],
     "requires": [

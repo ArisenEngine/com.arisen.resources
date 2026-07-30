@@ -31,7 +31,7 @@ public sealed class SceneRuntimeAssetCooker : IRuntimeAssetCooker
                 dependency.Guid,
                 ResolvePackageId(dependency.Guid, dependency.PackageId),
                 dependency.AssetType,
-                Variant: string.Empty,
+                dependency.Variant,
                 dependency.Required))
             .ToArray();
         return RuntimeAssetCookerOutput.FromFile(
