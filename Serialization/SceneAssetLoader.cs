@@ -412,6 +412,17 @@ public static class SceneAssetLoader
                 return false;
             }
 
+            if (!TryBuildExtensionComponents(
+                    assetDatabase,
+                    sceneGuid,
+                    sourcePath,
+                    sourceEntity,
+                    out SceneStagedExtensionComponent[] extensionComponents,
+                    out diagnostic))
+            {
+                return false;
+            }
+
             var stagedEntity = new SceneStagingEntity(
                 sourceEntity.Guid,
                 parentGuid,
@@ -433,7 +444,8 @@ public static class SceneAssetLoader
                 sourceEntity.Environment == null
                     ? null
                     : ToSceneEnvironment(sourceEntity.Environment),
-                NormalizePackageId(sourceEntity.Environment?.EnvironmentTexture?.PackageId));
+                NormalizePackageId(sourceEntity.Environment?.EnvironmentTexture?.PackageId),
+                extensionComponents);
             if (!SceneStagingValidation.TryValidate(
                     stagedEntity,
                     i,
@@ -461,6 +473,16 @@ public static class SceneAssetLoader
             componentSchemas,
             entities);
         if (!TryValidateStagedHierarchy(staging, out diagnostic))
+        {
+            staging = null!;
+            return false;
+        }
+
+
+        if (!SceneStagingValidation.TryCollectExclusiveOwnerships(
+                staging,
+                out _,
+                out diagnostic))
         {
             staging = null!;
             return false;
@@ -539,6 +561,17 @@ public static class SceneAssetLoader
                 {
                     entityManager.AddComponent(entity, meshRenderer);
                     meshRendererCount++;
+                }
+
+                SceneStagedExtensionComponent[] extensionComponents =
+                    stagedEntity.ExtensionComponents ?? Array.Empty<SceneStagedExtensionComponent>();
+                for (int componentIndex = 0;
+                     componentIndex < extensionComponents.Length;
+                     componentIndex++)
+                {
+                    ref readonly SceneStagedExtensionComponent extension =
+                        ref extensionComponents[componentIndex];
+                    extension.Codec.AddToEntity(entityManager, entity, extension.Value);
                 }
             }
 
@@ -1272,6 +1305,79 @@ public static class SceneAssetLoader
         return new SceneLoadResult(true, 0, 0, 0, 0, 0, 0, 0, string.Empty);
     }
 
+    private static bool TryBuildExtensionComponents(
+        IAssetDatabase assetDatabase,
+        Guid sceneGuid,
+        string sourcePath,
+        SceneEntitySource sourceEntity,
+        out SceneStagedExtensionComponent[] components,
+        out string diagnostic)
+    {
+        if (sourceEntity.ExtensionComponents.Count == 0)
+        {
+            components = Array.Empty<SceneStagedExtensionComponent>();
+            diagnostic = string.Empty;
+            return true;
+        }
+
+        var staged = new List<SceneStagedExtensionComponent>(
+            sourceEntity.ExtensionComponents.Count);
+        var context = new SceneComponentReadContext(
+            assetDatabase,
+            sceneGuid,
+            sourceEntity.Guid,
+            sourcePath);
+        foreach ((uint typeId, YamlMappingNode source) in
+                 sourceEntity.ExtensionComponents.OrderBy(pair => pair.Key))
+        {
+            if (!SceneComponentSchemas.TryGetByTypeId(typeId, out var codec) ||
+                codec.Extension == null)
+            {
+                components = Array.Empty<SceneStagedExtensionComponent>();
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{sourcePath}' entity " +
+                    $"'{sourceEntity.Guid:D}' extension TypeId '{typeId}' is not registered.";
+                return false;
+            }
+
+            try
+            {
+                if (!codec.Extension.TryReadSource(
+                        context,
+                        source,
+                        out object component,
+                        out diagnostic))
+                {
+                    components = Array.Empty<SceneStagedExtensionComponent>();
+                    return false;
+                }
+
+                if (component == null)
+                {
+                    components = Array.Empty<SceneStagedExtensionComponent>();
+                    diagnostic =
+                        $"[SceneAssetLoader] Scene '{sourcePath}' entity " +
+                        $"'{sourceEntity.Guid:D}' extension '{codec.Info.Name}' returned null staging data.";
+                    return false;
+                }
+
+                staged.Add(new SceneStagedExtensionComponent(codec.Extension, component));
+            }
+            catch (Exception ex)
+            {
+                components = Array.Empty<SceneStagedExtensionComponent>();
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{sourcePath}' entity " +
+                    $"'{sourceEntity.Guid:D}' extension '{codec.Info.Name}' failed: {ex.Message}";
+                return false;
+            }
+        }
+
+        components = staged.ToArray();
+        diagnostic = string.Empty;
+        return true;
+    }
+
     private static bool TryReadSceneDocument(
         string sourcePath,
         string sourceText,
@@ -1320,15 +1426,54 @@ public static class SceneAssetLoader
                 return false;
             }
 
+            if (!SceneComponentSchemas.TryGetChild(root, "Entities", out var entitiesNode) ||
+                entitiesNode is not YamlSequenceNode sourceEntities ||
+                sourceEntities.Children.Count != document.Entities.Count)
+            {
+                diagnostic =
+                    $"[SceneAssetLoader] Scene '{sourcePath}' prepared entity sequence does not match its document.";
+                document = null;
+                return false;
+            }
+
             for (int entityIndex = 0; entityIndex < document.Entities.Count; entityIndex++)
             {
                 var entity = document.Entities[entityIndex];
+                if (sourceEntities.Children[entityIndex] is not YamlMappingNode sourceEntityNode)
+                {
+                    diagnostic =
+                        $"[SceneAssetLoader] Scene '{sourcePath}' entity {entityIndex} must be a mapping.";
+                    document = null;
+                    return false;
+                }
+
                 for (int schemaIndex = 0; schemaIndex < document.ComponentSchemas.Count; schemaIndex++)
                 {
                     if (SceneComponentSchemas.TryGetByTypeId(
                             document.ComponentSchemas[schemaIndex].TypeId,
                             out var codec))
                     {
+                        if (codec.Extension != null)
+                        {
+                            if (SceneComponentSchemas.TryGetChild(
+                                    sourceEntityNode,
+                                    codec.Info.Name,
+                                    out var extensionNode))
+                            {
+                                if (extensionNode is not YamlMappingNode extensionMapping)
+                                {
+                                    diagnostic =
+                                        $"[SceneAssetLoader] Scene '{sourcePath}' entity " +
+                                        $"'{entity.Guid:D}' component '{codec.Info.Name}' must be a mapping.";
+                                    document = null;
+                                    return false;
+                                }
+
+                                entity.ExtensionComponents.Add(codec.Info.TypeId, extensionMapping);
+                            }
+                            continue;
+                        }
+
                         object? component = codec.Read(entity);
                         codec.Write(entity, component);
                     }

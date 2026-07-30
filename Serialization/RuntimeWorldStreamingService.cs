@@ -1106,7 +1106,8 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             var activation = m_SceneService.ActivatePreparedAdditiveAtFrameBoundary(
                 scene,
                 placedStaging,
-                cell.SourceKind);
+                cell.SourceKind,
+                cell.Descriptor.Id);
             double activationMilliseconds = Stopwatch.GetElapsedTime(activationStarted).TotalMilliseconds;
             WorldCellStreamingSnapshot changed;
             lock (m_Gate)

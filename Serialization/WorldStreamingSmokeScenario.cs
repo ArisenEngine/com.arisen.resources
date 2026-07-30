@@ -63,6 +63,8 @@ internal sealed class WorldStreamingSmokeScenarioProvider : IRuntimeSmokeScenari
 internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 {
     private const int SoakCycleCount = 4;
+    private const float MidShadowCameraRetreat = 20.0f;
+    private const float FarShadowCameraRetreat = 64.0f;
 
     private readonly RuntimeSmokeScenarioContext m_Context;
     private readonly IRuntimeWorldStreamingService m_Streaming;
@@ -85,6 +87,9 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
     private WorldPosition m_NearSource;
     private WorldPosition m_CancellationSource;
     private WorldPosition m_FarSource;
+    private Entity m_ValidationCamera;
+    private WorldPosition m_ValidationCameraWorldPosition;
+    private Quaternion m_ValidationCameraRotation;
     private WorldStreamingSmokeStage m_Stage;
     private WorldStreamingSmokeBounds? m_FirstLoadedBounds;
     private int m_SoakCyclesCompleted;
@@ -96,6 +101,7 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
     private bool m_OriginStable = true;
     private bool m_CountsStable = true;
     private bool m_BoundsStable = true;
+    private bool m_HasValidationCamera;
 
     public WorldStreamingSmokeScenario(
         RuntimeSmokeScenarioContext context,
@@ -138,6 +144,10 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         SelectValidationCells(m_World);
         ConfigureValidationBudgets();
         CapturePersistentWorldPositions();
+        if (m_Context.VisualSummaryService != null)
+        {
+            CaptureValidationCamera();
+        }
         m_Streaming.CellStateChanged += OnCellStateChanged;
         m_Origin.RebaseStarting += OnRebaseStarting;
         m_Origin.Rebased += OnRebased;
@@ -194,6 +204,30 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
                 {
                     m_SoakCyclesCompleted++;
                     BeginSoakLoad();
+                }
+                break;
+            case WorldStreamingSmokeStage.AwaitShadowNearCapture:
+                if (VisualCaptureCompleted("shadow-near"))
+                {
+                    BeginShadowMidCapture(frameIndex);
+                }
+                break;
+            case WorldStreamingSmokeStage.AwaitShadowMidCapture:
+                if (VisualCaptureCompleted("shadow-mid"))
+                {
+                    BeginShadowFarCapture(frameIndex);
+                }
+                break;
+            case WorldStreamingSmokeStage.AwaitShadowFarCapture:
+                if (VisualCaptureCompleted("shadow-far"))
+                {
+                    BeginShadowFarStableCapture(frameIndex);
+                }
+                break;
+            case WorldStreamingSmokeStage.AwaitShadowFarStableCapture:
+                if (VisualCaptureCompleted("shadow-far-stable"))
+                {
+                    BeginAfterCapture(frameIndex);
                 }
                 break;
             case WorldStreamingSmokeStage.AwaitAfterCapture:
@@ -347,6 +381,83 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         }
     }
 
+    private void CaptureValidationCamera()
+    {
+        var cameraPool = m_EntityManager!.GetPool<CameraComponent>();
+        var transformPool = m_EntityManager.GetPool<TransformComponent>();
+        ReadOnlySpan<Entity> cameraEntities = cameraPool.GetRawEntityArray();
+        for (int index = 0; index < cameraPool.Count; index++)
+        {
+            Entity entity = cameraEntities[index];
+            if (!m_EntityManager.IsAlive(entity) || !transformPool.Has(entity))
+            {
+                continue;
+            }
+
+            if (m_HasValidationCamera)
+            {
+                throw new InvalidOperationException(
+                    "World-streaming visual validation requires exactly one persistent camera.");
+            }
+
+            ref TransformComponent transform = ref transformPool.GetRef(entity);
+            if (!IsFinite(transform.Position) || !IsFinite(transform.Rotation))
+            {
+                throw new InvalidOperationException(
+                    "World-streaming visual validation camera transform is not finite.");
+            }
+
+            m_ValidationCamera = entity;
+            m_ValidationCameraWorldPosition = m_Origin.ToWorld(transform.Position);
+            m_ValidationCameraRotation = transform.Rotation;
+            m_HasValidationCamera = true;
+        }
+
+        if (!m_HasValidationCamera)
+        {
+            throw new InvalidOperationException(
+                "World-streaming visual validation requires one persistent camera.");
+        }
+    }
+
+    private void SetValidationCameraRetreat(float retreat)
+    {
+        if (!m_HasValidationCamera ||
+            m_EntityManager == null ||
+            !m_EntityManager.IsAlive(m_ValidationCamera) ||
+            !m_EntityManager.HasComponent<TransformComponent>(m_ValidationCamera))
+        {
+            throw new InvalidOperationException(
+                "World-streaming visual validation camera is no longer available.");
+        }
+
+        Vector3 forward = Vector3.Transform(Vector3.UnitZ, m_ValidationCameraRotation);
+        float forwardLengthSquared = forward.LengthSquared();
+        if (!float.IsFinite(retreat) || retreat < 0.0f ||
+            !float.IsFinite(forwardLengthSquared) || forwardLengthSquared <= 0.000001f)
+        {
+            throw new InvalidOperationException(
+                "World-streaming visual validation camera direction is invalid.");
+        }
+
+        forward /= MathF.Sqrt(forwardLengthSquared);
+        var worldPosition = new WorldPosition(
+            m_ValidationCameraWorldPosition.X - forward.X * retreat,
+            m_ValidationCameraWorldPosition.Y - forward.Y * retreat,
+            m_ValidationCameraWorldPosition.Z - forward.Z * retreat);
+        if (!m_Origin.TryToOriginRelative(worldPosition, out Vector3 originRelativePosition))
+        {
+            throw new InvalidOperationException(
+                "World-streaming visual validation camera could not be represented relative to the current origin.");
+        }
+
+        ref TransformComponent transform = ref m_EntityManager.GetComponent<TransformComponent>(
+            m_ValidationCamera);
+        transform.Position = originRelativePosition;
+        transform.Rotation = m_ValidationCameraRotation;
+        m_PersistentWorldPositions[m_ValidationCamera] = worldPosition;
+    }
+
     private void BeginInitialRequest()
     {
         m_Streaming.SetStreamingSource(m_NearSource);
@@ -417,20 +528,63 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
             return;
         }
 
-        if (ScheduleVisualCapture("after", checked(frameIndex + 1)))
-        {
-            m_Stage = WorldStreamingSmokeStage.AwaitAfterCapture;
-        }
-        else
-        {
-            BeginFinalDrain();
-        }
+        BeginShadowNearCapture(frameIndex);
     }
 
     private void BeginFinalDrain()
     {
         m_Streaming.SetStreamingSource(m_FarSource);
         m_Stage = WorldStreamingSmokeStage.AwaitFinalDrain;
+    }
+
+    private void BeginShadowNearCapture(uint frameIndex)
+    {
+        if (m_Context.VisualSummaryService == null)
+        {
+            BeginFinalDrain();
+            return;
+        }
+
+        SetValidationCameraRetreat(0.0f);
+        if (ScheduleVisualCapture("shadow-near", checked(frameIndex + 1)))
+        {
+            m_Stage = WorldStreamingSmokeStage.AwaitShadowNearCapture;
+        }
+    }
+
+    private void BeginShadowMidCapture(uint frameIndex)
+    {
+        SetValidationCameraRetreat(MidShadowCameraRetreat);
+        if (ScheduleVisualCapture("shadow-mid", checked(frameIndex + 1)))
+        {
+            m_Stage = WorldStreamingSmokeStage.AwaitShadowMidCapture;
+        }
+    }
+
+    private void BeginShadowFarCapture(uint frameIndex)
+    {
+        SetValidationCameraRetreat(FarShadowCameraRetreat);
+        if (ScheduleVisualCapture("shadow-far", checked(frameIndex + 1)))
+        {
+            m_Stage = WorldStreamingSmokeStage.AwaitShadowFarCapture;
+        }
+    }
+
+    private void BeginShadowFarStableCapture(uint frameIndex)
+    {
+        if (ScheduleVisualCapture("shadow-far-stable", checked(frameIndex + 1)))
+        {
+            m_Stage = WorldStreamingSmokeStage.AwaitShadowFarStableCapture;
+        }
+    }
+
+    private void BeginAfterCapture(uint frameIndex)
+    {
+        SetValidationCameraRetreat(0.0f);
+        if (ScheduleVisualCapture("after", checked(frameIndex + 1)))
+        {
+            m_Stage = WorldStreamingSmokeStage.AwaitAfterCapture;
+        }
     }
 
     private bool IsFullyDrained()
@@ -805,6 +959,17 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         Math.Abs(left.Y - right.Y) <= epsilon &&
         Math.Abs(left.Z - right.Z) <= epsilon;
 
+    private static bool IsFinite(Vector3 value) =>
+        float.IsFinite(value.X) &&
+        float.IsFinite(value.Y) &&
+        float.IsFinite(value.Z);
+
+    private static bool IsFinite(Quaternion value) =>
+        float.IsFinite(value.X) &&
+        float.IsFinite(value.Y) &&
+        float.IsFinite(value.Z) &&
+        float.IsFinite(value.W);
+
     private static string GetDefaultOutputPath(string workspacePath, string profileName)
     {
         string safeProfile = string.Concat(profileName.Select(character =>
@@ -827,6 +992,10 @@ internal enum WorldStreamingSmokeStage
     AwaitFirstUnload,
     AwaitSoakLoad,
     AwaitSoakUnload,
+    AwaitShadowNearCapture,
+    AwaitShadowMidCapture,
+    AwaitShadowFarCapture,
+    AwaitShadowFarStableCapture,
     AwaitAfterCapture,
     AwaitFinalDrain,
     ReadyForShutdown

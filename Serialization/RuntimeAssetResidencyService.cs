@@ -165,7 +165,8 @@ public sealed record RuntimeAssetResidencySnapshot(
     long LastNeededSequence,
     bool SourceBacked,
     string ProviderId,
-    string Diagnostic);
+    string Diagnostic,
+    IReadOnlyList<RuntimeAssetResidencyOwnerId> Owners);
 
 public sealed record RuntimeAssetResidencyMetrics(
     int ResidentAssetCount,
@@ -197,6 +198,7 @@ public interface IRuntimeAssetResidencyService
         CancellationToken cancellationToken = default);
     void RegisterPreparedProvider(IRuntimePreparedAssetProvider provider);
     bool UnregisterPreparedProvider(string providerId);
+    bool InvalidatePreparedProvider(string providerId, string diagnostic);
     void ProcessAtFrameBoundary();
     IReadOnlyList<RuntimeAssetResidencySnapshot> GetResources();
     RuntimeAssetResidencyMetrics GetMetrics();
@@ -380,6 +382,36 @@ public sealed class RuntimeAssetResidencyService : IRuntimeAssetResidencyService
         return true;
     }
 
+    public bool InvalidatePreparedProvider(string providerId, string diagnostic)
+    {
+        if (string.IsNullOrWhiteSpace(providerId)) return false;
+        List<RuntimeAssetResidencyKey> releases;
+        IRuntimePreparedAssetProvider? provider;
+        lock (m_Gate)
+        {
+            if (!m_Providers.TryGetValue(providerId, out provider)) return false;
+            releases = m_Resources.Values
+                .Where(entry => string.Equals(entry.ProviderId, providerId, StringComparison.Ordinal))
+                .Select(entry => entry.Key)
+                .ToList();
+            foreach (RuntimeAssetResidencyKey key in releases)
+            {
+                ResourceEntry entry = m_Resources[key];
+                m_PreparedGpuBytes -= entry.EstimatedGpuBytes;
+                entry.EstimatedGpuBytes = 0;
+                entry.ProviderId = string.Empty;
+                entry.State = RuntimePreparedAssetState.Waiting;
+                entry.Diagnostic = string.IsNullOrWhiteSpace(diagnostic)
+                    ? "Prepared asset resources were invalidated."
+                    : diagnostic.Trim();
+            }
+        }
+
+        foreach (RuntimeAssetResidencyKey key in releases) provider.Release(key);
+        lock (m_Gate) RefreshPreparedGpuBytesLocked();
+        return true;
+    }
+
     public void ProcessAtFrameBoundary()
     {
         ThrowIfDisposed();
@@ -519,7 +551,9 @@ public sealed class RuntimeAssetResidencyService : IRuntimeAssetResidencyService
         for (int index = 0; index < dependencies.Count; index++)
         {
             CookedSceneDependency dependency = dependencies[index];
-            if (!RuntimeAssetVariantPolicy.TryResolve(dependency.AssetType, out string variant))
+            string variant = dependency.Variant;
+            if (string.IsNullOrEmpty(variant) &&
+                !RuntimeAssetVariantPolicy.TryResolve(dependency.AssetType, out variant))
             {
                 if (dependency.Required)
                 {
@@ -920,6 +954,7 @@ public sealed class RuntimeAssetResidencyService : IRuntimeAssetResidencyService
             LastNeededSequence,
             SourceBacked,
             ProviderId,
-            Diagnostic);
+            Diagnostic,
+            Owners.Order().ToArray());
     }
 }
