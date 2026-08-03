@@ -88,21 +88,12 @@ public static class WorldAssetCooker
             Cells = cells
         };
         byte[] payload = WritePayload(descriptor);
-        string outputPath = assetDatabase.GetCookedArtifactPath(
+        using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
             worldRef.Guid,
             RuntimeVariant,
             CookedExtension);
-        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-        WriteAtomically(outputPath, payload);
-
-        var output = new FileInfo(outputPath);
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            worldRef.Guid,
-            WorldAssetType,
-            RuntimeVariant,
-            output.FullName,
-            output.Length,
-            output.LastWriteTimeUtc));
+        WriteAtomically(write.OutputPath, payload);
+        CookedAssetRecord output = write.Commit(WorldAssetType);
 
         CookedWorldDependency[] dependencies = scenes.Values
             .OrderBy(scene => scene.Reference.Guid)
@@ -116,14 +107,14 @@ public static class WorldAssetCooker
             .ToArray();
         Logger.Info(
             $"[WorldAssetCooker] Cooked world {worldRef.Guid:D} | Cells: {cells.Length} | " +
-            $"Scene dependencies: {dependencies.Length} | Bytes: {output.Length} | Output: {output.FullName}");
+            $"Scene dependencies: {dependencies.Length} | Bytes: {output.SizeInBytes} | Output: {output.Path}");
         return new CookedWorldArtifact(
             worldRef.Guid,
             RuntimeVariant,
-            output.FullName,
+            output.Path,
             cells.Length,
             descriptor.EntityReferences.Count,
-            output.Length,
+            output.SizeInBytes,
             dependencies);
     }
 

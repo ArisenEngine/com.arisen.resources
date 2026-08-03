@@ -486,32 +486,23 @@ public static class SceneAssetCooker
         }
 
         byte[] bytes = WritePayload(staging);
-        string outputPath = assetDatabase.GetCookedArtifactPath(
+        using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
             sceneRef.Guid,
             RuntimeVariant,
             CookedExtension);
-        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
-        File.WriteAllBytes(outputPath, bytes);
-
-        var output = new FileInfo(outputPath);
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            sceneRef.Guid,
-            sourceAsset.AssetType,
-            RuntimeVariant,
-            output.FullName,
-            output.Length,
-            output.LastWriteTimeUtc));
+        File.WriteAllBytes(write.OutputPath, bytes);
+        CookedAssetRecord output = write.Commit(sourceAsset.AssetType);
 
         int assetReferenceCount = stagedReferences.Count;
         Logger.Info(
-            $"[SceneAssetCooker] Cooked scene {sceneRef.Guid:D} | Entities: {staging.Entities.Length} | Dependencies: {assetReferenceCount} | Bytes: {output.Length} | Output: {output.FullName}");
+            $"[SceneAssetCooker] Cooked scene {sceneRef.Guid:D} | Entities: {staging.Entities.Length} | Dependencies: {assetReferenceCount} | Bytes: {output.SizeInBytes} | Output: {output.Path}");
         return new CookedSceneArtifact(
             sceneRef.Guid,
             RuntimeVariant,
-            output.FullName,
+            output.Path,
             staging.Entities.Length,
             assetReferenceCount,
-            output.Length,
+            output.SizeInBytes,
             GetDependencies(staging));
     }
 
