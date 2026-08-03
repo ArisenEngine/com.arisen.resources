@@ -2,6 +2,7 @@ using System.Diagnostics;
 using ArisenEngine.Core.Assets;
 using ArisenEngine.Core.Diagnostics;
 using ArisenEngine.Threading;
+using ArisenKernel.Diagnostics;
 
 namespace ArisenEngine.Resources.Serialization;
 
@@ -95,14 +96,34 @@ public sealed record WorldStreamingMetrics(
     long BudgetStallCount,
     double LastLoadLatencyMilliseconds,
     double LastActivationMilliseconds,
-    double LastUnloadMilliseconds);
+    double LastUnloadMilliseconds,
+    long SubscriberFailureCount);
+
+public enum WorldStreamingDiagnosticKind
+{
+    Cell,
+    SubscriberAggregate
+}
+
+public sealed record WorldStreamingSubscriberFailure(
+    string Notification,
+    string Payload,
+    string Subscriber,
+    string ExceptionType,
+    string Message);
 
 public sealed record WorldStreamingDiagnostic(
     long Sequence,
     WorldCellId CellId,
     WorldCellStreamingState State,
     long RequestGeneration,
-    string Message);
+    string Message)
+{
+    public WorldStreamingDiagnosticKind Kind { get; init; } = WorldStreamingDiagnosticKind.Cell;
+    public string Boundary { get; init; } = string.Empty;
+    public IReadOnlyList<WorldStreamingSubscriberFailure> SubscriberFailures { get; init; } =
+        Array.Empty<WorldStreamingSubscriberFailure>();
+}
 
 public readonly record struct RuntimeWorldLoadResult(
     bool Success,
@@ -139,6 +160,10 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
     private const string ActiveCellLimitDiagnosticPrefix =
         "Cell request was deferred by the world active-cell limit";
 
+    private readonly record struct CapturedSubscriberFailure(
+        WorldStreamingSubscriberFailure Diagnostic,
+        Exception Error);
+
     private readonly object m_Gate = new();
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly RuntimeSceneService m_SceneService;
@@ -163,6 +188,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
     private long m_PeakDecodedStagingBytes;
     private long m_CancellationCount;
     private long m_FailureCount;
+    private long m_SubscriberFailureCount;
     private long m_StaleCompletionCount;
     private long m_BudgetStallCount;
     private double m_LastLoadLatencyMilliseconds;
@@ -256,12 +282,27 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
 
     public RuntimeWorldLoadResult LoadWorld(AssetRef<WorldSourceAsset> world)
     {
+        List<CapturedSubscriberFailure>? subscriberFailures = null;
+        try
+        {
+            return LoadWorldCore(world, ref subscriberFailures);
+        }
+        finally
+        {
+            ReportSubscriberFailures(nameof(LoadWorld), subscriberFailures);
+        }
+    }
+
+    private RuntimeWorldLoadResult LoadWorldCore(
+        AssetRef<WorldSourceAsset> world,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
         if (!world.IsValid)
         {
             return new RuntimeWorldLoadResult(false, Guid.Empty, 0, "World asset ref is empty.");
         }
 
-        Shutdown(unloadActiveCells: true);
+        ShutdownCore(unloadActiveCells: true, ref subscriberFailures);
         WorldDescriptorLoadResult loaded = m_AssetDatabase.CanReadSourceAssets
             ? WorldDescriptorLoader.LoadSource(m_AssetDatabase, world)
             : WorldAssetCooker.LoadCooked(m_AssetDatabase, world);
@@ -332,7 +373,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         }
 
         PlotMetrics();
-        ActiveWorldChanged?.Invoke(world);
+        PublishActiveWorldChanged(world, ref subscriberFailures);
         return new RuntimeWorldLoadResult(true, descriptor.WorldGuid, descriptor.Cells.Count, string.Empty);
     }
 
@@ -381,6 +422,22 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
 
     public bool SetCellPreviewSource(WorldCellId cellId, SceneSourceSnapshot? snapshot)
     {
+        List<CapturedSubscriberFailure>? subscriberFailures = null;
+        try
+        {
+            return SetCellPreviewSourceCore(cellId, snapshot, ref subscriberFailures);
+        }
+        finally
+        {
+            ReportSubscriberFailures(nameof(SetCellPreviewSource), subscriberFailures);
+        }
+    }
+
+    private bool SetCellPreviewSourceCore(
+        WorldCellId cellId,
+        SceneSourceSnapshot? snapshot,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
         if (!m_AssetDatabase.CanReadSourceAssets)
         {
             throw new InvalidOperationException(
@@ -408,10 +465,25 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             cell.PreviewSource = snapshot;
         }
 
-        return RequestCellReload(cellId);
+        return RequestCellReloadCore(cellId, ref subscriberFailures);
     }
 
     public bool RequestCellReload(WorldCellId cellId)
+    {
+        List<CapturedSubscriberFailure>? subscriberFailures = null;
+        try
+        {
+            return RequestCellReloadCore(cellId, ref subscriberFailures);
+        }
+        finally
+        {
+            ReportSubscriberFailures(nameof(RequestCellReload), subscriberFailures);
+        }
+    }
+
+    private bool RequestCellReloadCore(
+        WorldCellId cellId,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         var changes = new List<WorldCellStreamingSnapshot>(2);
         lock (m_Gate)
@@ -461,11 +533,26 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             }
         }
 
-        Publish(changes);
+        Publish(changes, ref subscriberFailures);
         return true;
     }
 
     public bool RetryCell(WorldCellId cellId)
+    {
+        List<CapturedSubscriberFailure>? subscriberFailures = null;
+        try
+        {
+            return RetryCellCore(cellId, ref subscriberFailures);
+        }
+        finally
+        {
+            ReportSubscriberFailures(nameof(RetryCell), subscriberFailures);
+        }
+    }
+
+    private bool RetryCellCore(
+        WorldCellId cellId,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         WorldCellStreamingSnapshot? changed = null;
         lock (m_Gate)
@@ -497,7 +584,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
 
         }
 
-        Publish(changed);
+        Publish(changed, ref subscriberFailures);
         return true;
     }
 
@@ -521,6 +608,20 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
 
     internal void ProcessAtFrameBoundary()
     {
+        List<CapturedSubscriberFailure>? subscriberFailures = null;
+        try
+        {
+            ProcessAtFrameBoundaryCore(ref subscriberFailures);
+        }
+        finally
+        {
+            ReportSubscriberFailures(nameof(ProcessAtFrameBoundary), subscriberFailures);
+        }
+    }
+
+    private void ProcessAtFrameBoundaryCore(
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
         using var _ = Profiler.Zone("WorldStreaming.FrameBoundary");
         lock (m_Gate)
         {
@@ -531,17 +632,32 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         {
             m_OriginService.ProcessAtFrameBoundary(entityManager);
         }
-        PlanDesiredCells();
-        ProcessCompletedReads();
+        PlanDesiredCells(ref subscriberFailures);
+        ProcessCompletedReads(ref subscriberFailures);
         m_ResidencyService.ProcessAtFrameBoundary();
-        ProcessWaitingResources();
-        AdmitQueuedReads();
-        UnloadUndesiredCells();
-        ActivateReadyCells();
+        ProcessWaitingResources(ref subscriberFailures);
+        AdmitQueuedReads(ref subscriberFailures);
+        UnloadUndesiredCells(ref subscriberFailures);
+        ActivateReadyCells(ref subscriberFailures);
         PlotMetrics();
     }
 
     internal void Shutdown(bool unloadActiveCells)
+    {
+        List<CapturedSubscriberFailure>? subscriberFailures = null;
+        try
+        {
+            ShutdownCore(unloadActiveCells, ref subscriberFailures);
+        }
+        finally
+        {
+            ReportSubscriberFailures(nameof(Shutdown), subscriberFailures);
+        }
+    }
+
+    private void ShutdownCore(
+        bool unloadActiveCells,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         BackgroundTask<CellPayloadLoadResult>[] tasks;
         RuntimeCell[] activeCells;
@@ -607,10 +723,13 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         foreach (RuntimeAssetResidencyLease lease in leases) lease.Dispose();
         persistentLease?.Dispose();
         m_ResidencyService.ProcessAtFrameBoundary();
-        if (publishWorldClosed) ActiveWorldChanged?.Invoke(null);
+        if (publishWorldClosed)
+        {
+            PublishActiveWorldChanged(null, ref subscriberFailures);
+        }
     }
 
-    private void PlanDesiredCells()
+    private void PlanDesiredCells(ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         using var _ = Profiler.Zone("WorldStreaming.PlanRequests");
         var changes = new List<WorldCellStreamingSnapshot>();
@@ -751,10 +870,10 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             }
         }
 
-        Publish(changes);
+        Publish(changes, ref subscriberFailures);
     }
 
-    private void ProcessCompletedReads()
+    private void ProcessCompletedReads(ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         var changes = new List<WorldCellStreamingSnapshot>();
         lock (m_Gate)
@@ -865,10 +984,10 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             }
         }
 
-        Publish(changes);
+        Publish(changes, ref subscriberFailures);
     }
 
-    private void ProcessWaitingResources()
+    private void ProcessWaitingResources(ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         using var _ = Profiler.Zone("WorldStreaming.WaitForResources");
         var changes = new List<WorldCellStreamingSnapshot>();
@@ -916,10 +1035,10 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             }
         }
 
-        Publish(changes);
+        Publish(changes, ref subscriberFailures);
     }
 
-    private void AdmitQueuedReads()
+    private void AdmitQueuedReads(ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         var changes = new List<WorldCellStreamingSnapshot>();
         lock (m_Gate)
@@ -990,7 +1109,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             }
         }
 
-        Publish(changes);
+        Publish(changes, ref subscriberFailures);
     }
 
     private CellPayloadLoadResult LoadCellAndAcquireResidency(
@@ -1029,7 +1148,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         }
     }
 
-    private void ActivateReadyCells()
+    private void ActivateReadyCells(ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         using var _ = Profiler.Zone("WorldStreaming.Activate");
         long started = Stopwatch.GetTimestamp();
@@ -1098,7 +1217,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                     failed = TransitionLocked(cell, WorldCellStreamingState.Failed);
                     AddDiagnosticLocked(cell);
                 }
-                Publish(failed);
+                Publish(failed, ref subscriberFailures);
                 activated++;
                 continue;
             }
@@ -1132,12 +1251,12 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 }
             }
 
-            Publish(changed);
+            Publish(changed, ref subscriberFailures);
             activated++;
         }
     }
 
-    private void UnloadUndesiredCells()
+    private void UnloadUndesiredCells(ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         using var _ = Profiler.Zone("WorldStreaming.Unload");
         int unloaded = 0;
@@ -1164,8 +1283,8 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 unloading = TransitionLocked(cell, WorldCellStreamingState.Unloading);
             }
 
-            Publish(queued);
-            Publish(unloading);
+            Publish(queued, ref subscriberFailures);
+            Publish(unloading, ref subscriberFailures);
             using var cellZone = Profiler.Zone(
                 $"WorldStreaming.Unload/{cell.Descriptor.Id}");
             long unloadStarted = Stopwatch.GetTimestamp();
@@ -1195,7 +1314,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 }
             }
 
-            Publish(completed);
+            Publish(completed, ref subscriberFailures);
             unloaded++;
         }
     }
@@ -1297,12 +1416,17 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
 
     private void AddDiagnosticLocked(RuntimeCell cell)
     {
-        m_Diagnostics.Enqueue(new WorldStreamingDiagnostic(
+        EnqueueDiagnosticLocked(new WorldStreamingDiagnostic(
             ++m_NextDiagnosticSequence,
             cell.Descriptor.Id,
             cell.State,
             cell.RequestGeneration,
             cell.Diagnostic));
+    }
+
+    private void EnqueueDiagnosticLocked(WorldStreamingDiagnostic diagnostic)
+    {
+        m_Diagnostics.Enqueue(diagnostic);
         while (m_Diagnostics.Count > MaxDiagnostics) m_Diagnostics.Dequeue();
     }
 
@@ -1344,7 +1468,8 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             m_BudgetStallCount,
             m_LastLoadLatencyMilliseconds,
             m_LastActivationMilliseconds,
-            m_LastUnloadMilliseconds);
+            m_LastUnloadMilliseconds,
+            m_SubscriberFailureCount);
     }
 
     private void PlotMetrics()
@@ -1363,6 +1488,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         Profiler.PlotValue("WorldStreaming.PeakDecodedStagingBytes", metrics.PeakDecodedStagingBytes);
         Profiler.PlotValue("WorldStreaming.Cancellations", metrics.CancellationCount);
         Profiler.PlotValue("WorldStreaming.Failures", metrics.FailureCount);
+        Profiler.PlotValue("WorldStreaming.SubscriberFailures", metrics.SubscriberFailureCount);
         Profiler.PlotValue("WorldStreaming.StaleCompletions", metrics.StaleCompletionCount);
         Profiler.PlotValue("WorldStreaming.BudgetStalls", metrics.BudgetStallCount);
         Profiler.PlotValue("WorldStreaming.LastLoadLatencyMs", metrics.LastLoadLatencyMilliseconds);
@@ -1370,20 +1496,149 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         Profiler.PlotValue("WorldStreaming.LastUnloadMs", metrics.LastUnloadMilliseconds);
     }
 
-    private void Publish(IEnumerable<WorldCellStreamingSnapshot> snapshots)
+    private void Publish(
+        IEnumerable<WorldCellStreamingSnapshot> snapshots,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
-        foreach (WorldCellStreamingSnapshot snapshot in snapshots) Publish(snapshot);
+        foreach (WorldCellStreamingSnapshot snapshot in snapshots)
+        {
+            Publish(snapshot, ref subscriberFailures);
+        }
     }
 
-    private void Publish(WorldCellStreamingSnapshot? snapshot)
+    private void Publish(
+        WorldCellStreamingSnapshot? snapshot,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         if (snapshot == null) return;
         Action<WorldCellStreamingSnapshot>? handlers = CellStateChanged;
         if (handlers == null) return;
-        foreach (Action<WorldCellStreamingSnapshot> handler in handlers.GetInvocationList())
+        Delegate[] subscribers = handlers.GetInvocationList();
+        for (int index = 0; index < subscribers.Length; index++)
         {
-            try { handler(snapshot); }
-            catch { }
+            var subscriber = (Action<WorldCellStreamingSnapshot>)subscribers[index];
+            try
+            {
+                subscriber(snapshot);
+            }
+            catch (Exception error)
+            {
+                CaptureSubscriberFailure(
+                    "CellStateChanged",
+                    $"Cell={snapshot.CellId}, State={snapshot.State}, " +
+                    $"Generation={snapshot.RequestGeneration}, Transition={snapshot.TransitionSequence}",
+                    index,
+                    subscriber,
+                    error,
+                    ref subscriberFailures);
+            }
+        }
+    }
+
+    private void PublishActiveWorldChanged(
+        AssetRef<WorldSourceAsset>? world,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
+        Action<AssetRef<WorldSourceAsset>?>? handlers = ActiveWorldChanged;
+        if (handlers == null) return;
+
+        Delegate[] subscribers = handlers.GetInvocationList();
+        for (int index = 0; index < subscribers.Length; index++)
+        {
+            var subscriber = (Action<AssetRef<WorldSourceAsset>?>)subscribers[index];
+            try
+            {
+                subscriber(world);
+            }
+            catch (Exception error)
+            {
+                string payload = world is { } active
+                    ? $"World={active.Guid:D}, Package={active.PackageId}"
+                    : "World=<closed>";
+                CaptureSubscriberFailure(
+                    "ActiveWorldChanged",
+                    payload,
+                    index,
+                    subscriber,
+                    error,
+                    ref subscriberFailures);
+            }
+        }
+    }
+
+    private static void CaptureSubscriberFailure(
+        string notification,
+        string payload,
+        int subscriberIndex,
+        Delegate subscriber,
+        Exception error,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
+        string declaringType = subscriber.Method.DeclaringType?.FullName
+            ?? subscriber.Target?.GetType().FullName
+            ?? "<unknown>";
+        string identity = $"#{subscriberIndex + 1} '{declaringType}.{subscriber.Method.Name}'";
+        var diagnostic = new WorldStreamingSubscriberFailure(
+            notification,
+            payload,
+            identity,
+            error.GetType().FullName ?? error.GetType().Name,
+            error.Message);
+        (subscriberFailures ??= new List<CapturedSubscriberFailure>())
+            .Add(new CapturedSubscriberFailure(diagnostic, error));
+    }
+
+    private void ReportSubscriberFailures(
+        string boundary,
+        List<CapturedSubscriberFailure>? capturedFailures)
+    {
+        if (capturedFailures == null || capturedFailures.Count == 0) return;
+
+        var diagnostics = new WorldStreamingSubscriberFailure[capturedFailures.Count];
+        var attributedErrors = new Exception[capturedFailures.Count];
+        for (int index = 0; index < capturedFailures.Count; index++)
+        {
+            CapturedSubscriberFailure captured = capturedFailures[index];
+            diagnostics[index] = captured.Diagnostic;
+            attributedErrors[index] = new InvalidOperationException(
+                $"World-streaming notification '{captured.Diagnostic.Notification}' subscriber " +
+                $"{captured.Diagnostic.Subscriber} failed for {captured.Diagnostic.Payload}.",
+                captured.Error);
+        }
+
+        var aggregate = new AggregateException(
+            $"World-streaming boundary '{boundary}' completed with " +
+            $"{capturedFailures.Count} subscriber callback failure(s).",
+            attributedErrors);
+        string message = aggregate.Message + " " + string.Join(
+            " | ",
+            diagnostics.Select(failure =>
+                $"{failure.Notification} {failure.Subscriber} for {failure.Payload}: " +
+                $"{failure.ExceptionType}: {failure.Message}"));
+        lock (m_Gate)
+        {
+            m_SubscriberFailureCount += capturedFailures.Count;
+            EnqueueDiagnosticLocked(new WorldStreamingDiagnostic(
+                ++m_NextDiagnosticSequence,
+                default,
+                WorldCellStreamingState.Unloaded,
+                0,
+                message)
+            {
+                Kind = WorldStreamingDiagnosticKind.SubscriberAggregate,
+                Boundary = boundary,
+                SubscriberFailures = diagnostics
+            });
+        }
+
+        try
+        {
+            KernelLog.Error(aggregate.ToString());
+        }
+        catch (Exception reportingError)
+        {
+            Console.Error.WriteLine(
+                $"[ERROR] World-streaming subscriber aggregate logging failed: {reportingError}\n{aggregate}");
         }
     }
 
@@ -1399,6 +1654,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         m_PeakDecodedStagingBytes = 0;
         m_CancellationCount = 0;
         m_FailureCount = 0;
+        m_SubscriberFailureCount = 0;
         m_StaleCompletionCount = 0;
         m_BudgetStallCount = 0;
         m_LastLoadLatencyMilliseconds = 0;

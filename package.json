@@ -2,6 +2,9 @@
   "id": "com.arisen.resources",
   "name": "Arisen Resources Core",
   "version": "1.0.0",
+  "engine": {
+    "minVersion": "0.1.0"
+  },
   "layer": "domain",
   "author": "Arisen Team",
   "description": "Asset Serialization and Model parsing systems",
