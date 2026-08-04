@@ -190,6 +190,7 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
     }
 
     private readonly object m_Gate = new();
+    private readonly object m_OperationGate = new();
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly Func<EntityManager> m_EntityManagerProvider;
     private readonly List<PendingSceneOperation> m_PendingOperations = new();
@@ -199,8 +200,16 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         m_ComponentOwners = new();
     private readonly Queue<RuntimeSceneInstanceSnapshot> m_TerminalSnapshots = new();
     private readonly Queue<RuntimeSceneDiagnostic> m_Diagnostics = new();
+    private Action<AssetRef<SceneSourceAsset>, SceneSourceSnapshot?>?
+        m_WorldPersistentSceneReplacementHandler;
     private EntityManager? m_EntityManager;
     private RuntimeSceneState? m_ActiveScene;
+    private RuntimeSceneInstanceId m_WorldOwnedPersistentInstanceId;
+    private bool m_WorldPersistentStartupPending;
+    private bool m_WorldPersistentRollbackBlocked;
+    private bool m_WorldLifecycleDrainInProgress;
+    private int m_OperationOwnerThreadId;
+    private string m_ActiveOperation = string.Empty;
     private long m_NextInstanceId;
     private long m_NextOperationSequence;
     private long m_NextDiagnosticSequence;
@@ -230,11 +239,108 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             ?? throw new ArgumentNullException(nameof(entityManagerProvider));
     }
 
+    internal void SetWorldPersistentSceneReplacementHandler(
+        Action<AssetRef<SceneSourceAsset>, SceneSourceSnapshot?> handler)
+    {
+        ArgumentNullException.ThrowIfNull(handler);
+        lock (m_Gate)
+        {
+            if (m_WorldPersistentSceneReplacementHandler != null &&
+                m_WorldPersistentSceneReplacementHandler != handler)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] A world persistent-scene replacement owner is already registered.");
+            }
+
+            m_WorldPersistentSceneReplacementHandler = handler;
+        }
+    }
+
+    internal void BeginWorldLifecycleMutation()
+    {
+        int threadId = Environment.CurrentManagedThreadId;
+        // Close the scene-operation admission gate before publishing the drain
+        // flag. This lets an already-running operation finish, while preventing
+        // a new structural operation from starting in the gap before the flag is
+        // observed.
+        lock (m_OperationGate)
+        {
+            if (m_OperationOwnerThreadId == threadId)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] World lifecycle mutation cannot begin reentrantly from a scene operation.");
+            }
+
+            while (m_OperationOwnerThreadId != 0)
+            {
+                Monitor.Wait(m_OperationGate);
+            }
+
+            lock (m_Gate)
+            {
+                if (m_WorldLifecycleDrainInProgress)
+                {
+                    throw new InvalidOperationException(
+                        "[RuntimeSceneService] A world lifecycle mutation is already in progress.");
+                }
+
+                m_WorldLifecycleDrainInProgress = true;
+            }
+        }
+    }
+
+    internal void EndWorldLifecycleMutation()
+    {
+        lock (m_Gate)
+        {
+            if (!m_WorldLifecycleDrainInProgress)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] No world lifecycle mutation is in progress.");
+            }
+
+            m_WorldLifecycleDrainInProgress = false;
+        }
+    }
+
+    // World lifecycle entry points use this to reject observer-side reentry
+    // before waiting on the lifecycle gate held by the current scene operation.
+    internal bool IsSceneOperationOwnedByCurrentThread
+    {
+        get
+        {
+            int threadId = Environment.CurrentManagedThreadId;
+            lock (m_OperationGate)
+            {
+                return m_OperationOwnerThreadId == threadId;
+            }
+        }
+    }
+
+    internal void SetWorldPersistentRollbackBlocked(bool blocked)
+    {
+        lock (m_Gate)
+        {
+            m_WorldPersistentRollbackBlocked = blocked;
+        }
+    }
+
+    internal void SetWorldPersistentStartupPending(bool pending)
+    {
+        lock (m_Gate)
+        {
+            m_WorldPersistentStartupPending = pending;
+        }
+    }
+
     public SceneLoadResult LoadScene(AssetRef<SceneSourceAsset> scene)
     {
+        using SceneOperationScope sceneOperation = EnterSceneOperation(nameof(LoadScene));
         RuntimeSceneInstance instance;
         lock (m_Gate)
         {
+            ThrowIfWorldLifecycleMutationBlockedLocked(
+                "Synchronous persistent scene replacement");
             instance = CreateQueuedInstanceLocked(
                 scene,
                 RuntimeSceneInstanceKind.Persistent,
@@ -290,6 +396,14 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
 
         lock (m_Gate)
         {
+            if (m_WorldLifecycleDrainInProgress ||
+                m_WorldPersistentStartupPending ||
+                m_WorldPersistentRollbackBlocked)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] Additive scene activation is blocked by a world lifecycle boundary.");
+            }
+
             RuntimeSceneInstance instance = CreateQueuedInstanceLocked(
                 scene,
                 RuntimeSceneInstanceKind.Additive,
@@ -313,8 +427,19 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
 
         lock (m_Gate)
         {
+            if (m_WorldLifecycleDrainInProgress)
+            {
+                return false;
+            }
+
+            if (instanceId == m_WorldOwnedPersistentInstanceId)
+            {
+                return false;
+            }
+
             if (!m_Instances.TryGetValue(instanceId.Value, out RuntimeSceneInstance? instance)
-                || instance.State != RuntimeSceneInstanceState.Active)
+                || instance.State != RuntimeSceneInstanceState.Active
+                || instance.WorldCellId.IsValid)
             {
                 return false;
             }
@@ -427,8 +552,10 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             AssetRef<SceneSourceAsset> scene,
             SceneStagingData staging,
             string sourceKind,
-            WorldCellId worldCellId)
+            in SceneComponentActivationContext activationContext)
     {
+        using SceneOperationScope sceneOperation =
+            EnterSceneOperation(nameof(ActivatePreparedAdditiveAtFrameBoundary));
         ArgumentNullException.ThrowIfNull(staging);
         if (!scene.IsValid || staging.SceneGuid != scene.Guid)
         {
@@ -437,21 +564,29 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 nameof(scene));
         }
 
-        if (!worldCellId.IsValid)
+        if (!activationContext.HasWorldCell ||
+            !activationContext.CellOrigin.IsFinite ||
+            !activationContext.CellBounds.IsValid)
         {
             throw new ArgumentException(
-                "Prepared world-cell scene activation requires a valid cell identity.",
-                nameof(worldCellId));
+                "Prepared world-cell scene activation requires a valid cell identity, canonical origin, and descriptor bounds.",
+                nameof(activationContext));
         }
 
         RuntimeSceneInstance instance;
         lock (m_Gate)
         {
+            if (m_WorldLifecycleDrainInProgress)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] Additive scene activation cannot run while a world lifecycle drain is in progress.");
+            }
+
             instance = CreateQueuedInstanceLocked(
                 scene,
                 RuntimeSceneInstanceKind.Additive,
                 sourceRevision: 0,
-                worldCellId: worldCellId);
+                worldCellId: activationContext.WorldCellId);
         }
 
         SceneLoadResult result = ActivateInstance(
@@ -459,11 +594,188 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             snapshot: null,
             staging,
             sourceKind,
-            SceneReplacementMode.None);
+            SceneReplacementMode.None,
+            activationContext);
         return (instance.InstanceId, result);
     }
 
+    internal (RuntimeSceneInstanceId InstanceId, SceneLoadResult Result)
+        ActivatePreparedPersistentAtLifecycleBoundary(
+            AssetRef<SceneSourceAsset> scene,
+            SceneStagingData staging,
+            string sourceKind)
+    {
+        using SceneOperationScope sceneOperation =
+            EnterSceneOperation(nameof(ActivatePreparedPersistentAtLifecycleBoundary));
+        ArgumentNullException.ThrowIfNull(staging);
+        if (!scene.IsValid || staging.SceneGuid != scene.Guid)
+        {
+            throw new ArgumentException(
+                "Prepared persistent scene identity must match its validated staging payload.",
+                nameof(scene));
+        }
+
+        RuntimeSceneInstance instance;
+        lock (m_Gate)
+        {
+            if (!m_WorldLifecycleDrainInProgress)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] World-owned persistent activation requires an owning world lifecycle mutation.");
+            }
+
+            if (m_WorldOwnedPersistentInstanceId.IsValid)
+            {
+                throw new InvalidOperationException(
+                    $"[RuntimeSceneService] Persistent scene instance " +
+                    $"'{m_WorldOwnedPersistentInstanceId}' is already owned by a world.");
+            }
+
+            instance = CreateQueuedInstanceLocked(
+                scene,
+                RuntimeSceneInstanceKind.Persistent,
+                sourceRevision: 0);
+            m_WorldOwnedPersistentInstanceId = instance.InstanceId;
+        }
+
+        SceneLoadResult result;
+        try
+        {
+            result = ActivateInstance(
+                instance,
+                snapshot: null,
+                staging,
+                sourceKind,
+                SceneReplacementMode.All);
+        }
+        catch
+        {
+            ReleaseFailedWorldPersistentClaim(instance.InstanceId);
+            throw;
+        }
+
+        if (!result.Success)
+        {
+            ReleaseFailedWorldPersistentClaim(instance.InstanceId);
+        }
+
+        return (instance.InstanceId, result);
+    }
+
+    internal (RuntimeSceneInstanceId InstanceId, SceneLoadResult Result)
+        ActivatePreparedWorldPersistentReplacementAtLifecycleBoundary(
+            RuntimeSceneInstanceId expectedInstanceId,
+            AssetRef<SceneSourceAsset> scene,
+            SceneSourceSnapshot? snapshot,
+            SceneStagingData staging,
+            string sourceKind)
+    {
+        using SceneOperationScope sceneOperation = EnterSceneOperation(
+            nameof(ActivatePreparedWorldPersistentReplacementAtLifecycleBoundary));
+        ArgumentNullException.ThrowIfNull(staging);
+        if (!expectedInstanceId.IsValid || !scene.IsValid || staging.SceneGuid != scene.Guid)
+        {
+            throw new ArgumentException(
+                "World-owned persistent replacement identity must match its validated staging payload.",
+                nameof(scene));
+        }
+
+        RuntimeSceneInstance replacement;
+        lock (m_Gate)
+        {
+            if (m_WorldOwnedPersistentInstanceId != expectedInstanceId ||
+                !m_Instances.TryGetValue(expectedInstanceId.Value, out RuntimeSceneInstance? current) ||
+                current.Kind != RuntimeSceneInstanceKind.Persistent ||
+                (current.State != RuntimeSceneInstanceState.Active &&
+                 current.State != RuntimeSceneInstanceState.QueuedForUnload) ||
+                !IsSameScene(current.Scene, scene))
+            {
+                throw new InvalidOperationException(
+                    $"[RuntimeSceneService] Persistent replacement expected world-owned active instance " +
+                    $"'{expectedInstanceId}'.");
+            }
+
+            replacement = CreateQueuedInstanceLocked(
+                scene,
+                RuntimeSceneInstanceKind.Persistent,
+                snapshot?.Revision ?? 0);
+        }
+
+        SceneLoadResult result = ActivateInstance(
+            replacement,
+            snapshot,
+            staging,
+            sourceKind,
+            SceneReplacementMode.PersistentOnly,
+            worldPersistentReplacementFrom: expectedInstanceId);
+        return (replacement.InstanceId, result);
+    }
+
+    internal void ReportWorldPersistentReplacementFailure(
+        AssetRef<SceneSourceAsset> scene,
+        SceneSourceSnapshot? snapshot,
+        string diagnostic)
+    {
+        using SceneOperationScope sceneOperation =
+            EnterSceneOperation(nameof(ReportWorldPersistentReplacementFailure));
+        RuntimeSceneInstance failed;
+        lock (m_Gate)
+        {
+            if (m_WorldLifecycleDrainInProgress ||
+                m_WorldPersistentStartupPending ||
+                m_WorldPersistentRollbackBlocked)
+            {
+                return;
+            }
+
+            failed = CreateQueuedInstanceLocked(
+                scene,
+                RuntimeSceneInstanceKind.Persistent,
+                snapshot?.Revision ?? 0);
+        }
+
+        FailActivation(failed, diagnostic);
+    }
+
     internal bool UnloadSceneAtFrameBoundary(
+        RuntimeSceneInstanceId instanceId,
+        out string diagnostic)
+    {
+        using SceneOperationScope sceneOperation =
+            EnterSceneOperation(nameof(UnloadSceneAtFrameBoundary));
+        lock (m_Gate)
+        {
+            if (m_WorldLifecycleDrainInProgress)
+            {
+                diagnostic =
+                    "[RuntimeSceneService] Scene unload cannot start while a world lifecycle drain is in progress.";
+                return false;
+            }
+        }
+
+        return UnloadSceneCore(instanceId, out diagnostic);
+    }
+
+    internal bool UnloadSceneAtWorldLifecycleBoundary(
+        RuntimeSceneInstanceId instanceId,
+        out string diagnostic)
+    {
+        using SceneOperationScope sceneOperation =
+            EnterSceneOperation(nameof(UnloadSceneAtWorldLifecycleBoundary));
+        lock (m_Gate)
+        {
+            if (!m_WorldLifecycleDrainInProgress)
+            {
+                diagnostic =
+                    "[RuntimeSceneService] World lifecycle scene unload requires an owning lifecycle mutation.";
+                return false;
+            }
+        }
+
+        return UnloadSceneCore(instanceId, out diagnostic);
+    }
+
+    private bool UnloadSceneCore(
         RuntimeSceneInstanceId instanceId,
         out string diagnostic)
     {
@@ -494,11 +806,96 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         return false;
     }
 
+    internal bool UnloadAllScenesAtWorldLifecycleBoundary(out string diagnostic)
+    {
+        using SceneOperationScope sceneOperation =
+            EnterSceneOperation(nameof(UnloadAllScenesAtWorldLifecycleBoundary));
+        RuntimeSceneInstanceSnapshot[] unloadedSnapshots;
+        RuntimeSceneInstanceSnapshot[] cancelledSnapshots;
+        lock (m_Gate)
+        {
+            if (!m_WorldLifecycleDrainInProgress)
+            {
+                diagnostic =
+                    "[RuntimeSceneService] World lifecycle scene drain requires an owning lifecycle mutation.";
+                return false;
+            }
+
+            RuntimeSceneInstance[] ownedInstances = m_Instances.Values
+                .Where(instance =>
+                    instance.State == RuntimeSceneInstanceState.Active ||
+                    instance.State == RuntimeSceneInstanceState.QueuedForUnload)
+                .OrderBy(instance => instance.InstanceId.Value)
+                .ToArray();
+            RuntimeSceneInstance[] queuedInstances = m_Instances.Values
+                .Where(instance => instance.State == RuntimeSceneInstanceState.QueuedForActivation)
+                .OrderBy(instance => instance.InstanceId.Value)
+                .ToArray();
+
+            if (ownedInstances.Length > 0 &&
+                !TryValidateUnloadReferences(ownedInstances, out diagnostic))
+            {
+                return false;
+            }
+
+            string completedDiagnostic =
+                $"[RuntimeSceneService] Unloaded {ownedInstances.Length} scene instances and " +
+                $"cancelled {queuedInstances.Length} queued activations at the world lifecycle boundary.";
+            m_PendingOperations.Clear();
+            cancelledSnapshots = new RuntimeSceneInstanceSnapshot[queuedInstances.Length];
+            for (int index = 0; index < queuedInstances.Length; index++)
+            {
+                RuntimeSceneInstance queued = queuedInstances[index];
+                queued.State = RuntimeSceneInstanceState.Unloaded;
+                queued.Diagnostic =
+                    "[RuntimeSceneService] Queued scene activation was cancelled by the world lifecycle boundary.";
+                cancelledSnapshots[index] = queued.Snapshot();
+                m_Instances.Remove(queued.InstanceId.Value);
+                AddTerminalSnapshotLocked(cancelledSnapshots[index]);
+                AddDiagnosticLocked(queued);
+                if (m_WorldOwnedPersistentInstanceId == queued.InstanceId)
+                {
+                    m_WorldOwnedPersistentInstanceId = RuntimeSceneInstanceId.Invalid;
+                }
+            }
+
+            unloadedSnapshots = ownedInstances.Length == 0
+                ? Array.Empty<RuntimeSceneInstanceSnapshot>()
+                : DestroyInstances(
+                    ResolveEntityManager(),
+                    ownedInstances,
+                    completedDiagnostic);
+            m_WorldPersistentRollbackBlocked = false;
+            diagnostic = completedDiagnostic;
+        }
+
+        for (int index = 0; index < unloadedSnapshots.Length; index++)
+        {
+            PublishSceneInstanceStateChanged(unloadedSnapshots[index]);
+        }
+        for (int index = 0; index < cancelledSnapshots.Length; index++)
+        {
+            PublishSceneInstanceStateChanged(cancelledSnapshots[index]);
+        }
+
+        PlotInstanceCounts();
+        return true;
+    }
+
     internal SceneLoadResult? ProcessPendingSceneLoadAtFrameBoundary()
     {
+        using SceneOperationScope sceneOperation =
+            EnterSceneOperation(nameof(ProcessPendingSceneLoadAtFrameBoundary));
         PendingSceneOperation[] operations;
         lock (m_Gate)
         {
+            if (m_WorldLifecycleDrainInProgress ||
+                m_WorldPersistentStartupPending ||
+                m_WorldPersistentRollbackBlocked)
+            {
+                return null;
+            }
+
             if (m_PendingOperations.Count == 0)
             {
                 return null;
@@ -565,6 +962,10 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             m_TerminalSnapshots.Clear();
             m_Diagnostics.Clear();
             m_EntityManager = null;
+            m_WorldOwnedPersistentInstanceId = RuntimeSceneInstanceId.Invalid;
+            m_WorldPersistentStartupPending = false;
+            m_WorldPersistentRollbackBlocked = false;
+            m_WorldLifecycleDrainInProgress = false;
             Volatile.Write(ref m_ActiveScene, null);
         }
     }
@@ -573,8 +974,62 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         AssetRef<SceneSourceAsset> scene,
         SceneSourceSnapshot? snapshot)
     {
+        Action<AssetRef<SceneSourceAsset>, SceneSourceSnapshot?>? worldReplacementHandler = null;
         lock (m_Gate)
         {
+            if (m_WorldLifecycleDrainInProgress)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] Persistent scene replacement cannot be queued while a world lifecycle drain is in progress.");
+            }
+
+            if (m_WorldPersistentStartupPending)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] Persistent scene replacement cannot be queued while " +
+                    "a world persistent scene is waiting for residency.");
+            }
+
+            if (m_WorldOwnedPersistentInstanceId.IsValid)
+            {
+                if (!m_Instances.TryGetValue(
+                        m_WorldOwnedPersistentInstanceId.Value,
+                        out RuntimeSceneInstance? worldPersistent) ||
+                    worldPersistent.Kind != RuntimeSceneInstanceKind.Persistent)
+                {
+                    throw new InvalidOperationException(
+                        $"[RuntimeSceneService] World-owned persistent scene claim " +
+                        $"'{m_WorldOwnedPersistentInstanceId}' has no matching instance.");
+                }
+
+                if (!IsSameScene(worldPersistent.Scene, scene))
+                {
+                    throw new InvalidOperationException(
+                        "[RuntimeSceneService] Opening a different persistent scene is not allowed while a world owns the active persistent scene. Load the owning world instead.");
+                }
+
+                worldReplacementHandler = m_WorldPersistentSceneReplacementHandler
+                    ?? throw new InvalidOperationException(
+                        "[RuntimeSceneService] The active world has no persistent-scene replacement owner.");
+            }
+
+            if (worldReplacementHandler != null)
+            {
+                // The world owner queues and coalesces this request outside the scene lock.
+            }
+            else
+            {
+                QueueStandaloneReplacementLocked(scene, snapshot);
+            }
+        }
+
+        worldReplacementHandler?.Invoke(scene, snapshot);
+    }
+
+    private void QueueStandaloneReplacementLocked(
+        AssetRef<SceneSourceAsset> scene,
+        SceneSourceSnapshot? snapshot)
+    {
             SceneReplacementMode replacementMode =
                 m_ActiveScene is { } activeScene && IsSameScene(activeScene.Scene, scene)
                     ? SceneReplacementMode.PersistentOnly
@@ -610,6 +1065,39 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 scene,
                 snapshot,
                 replacementMode));
+    }
+
+    private void ThrowIfWorldLifecycleMutationBlockedLocked(string operation)
+    {
+        if (m_WorldLifecycleDrainInProgress)
+        {
+            throw new InvalidOperationException(
+                $"[RuntimeSceneService] {operation} cannot run while a world lifecycle drain is in progress.");
+        }
+
+        if (m_WorldPersistentStartupPending)
+        {
+            throw new InvalidOperationException(
+                $"[RuntimeSceneService] {operation} cannot run while a world persistent " +
+                "scene is waiting for residency.");
+        }
+
+        if (m_WorldOwnedPersistentInstanceId.IsValid)
+        {
+            throw new InvalidOperationException(
+                $"[RuntimeSceneService] {operation} cannot bypass world-owned persistent scene " +
+                $"'{m_WorldOwnedPersistentInstanceId}'. Queue a same-scene replacement instead.");
+        }
+    }
+
+    private void ReleaseFailedWorldPersistentClaim(RuntimeSceneInstanceId instanceId)
+    {
+        lock (m_Gate)
+        {
+            if (m_WorldOwnedPersistentInstanceId == instanceId)
+            {
+                m_WorldOwnedPersistentInstanceId = RuntimeSceneInstanceId.Invalid;
+            }
         }
     }
 
@@ -638,10 +1126,13 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         SceneSourceSnapshot? snapshot,
         SceneStagingData? preparedStaging,
         string preparedSourceKind,
-        SceneReplacementMode replacementMode)
+        SceneReplacementMode replacementMode,
+        SceneComponentActivationContext activationContext = default,
+        RuntimeSceneInstanceId worldPersistentReplacementFrom = default)
     {
         using var _ = Profiler.Zone("RuntimeSceneService.LoadScene");
         Entity[] activatedEntities = Array.Empty<Entity>();
+        bool replacementDestroyed = false;
         try
         {
             if (snapshot != null && !m_AssetDatabase.CanReadSourceAssets)
@@ -687,6 +1178,15 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
             RuntimeSceneInstance[] replacedInstances = replacementMode != SceneReplacementMode.None
                 ? GetActiveInstancesForReplacement(instance.InstanceId, replacementMode)
                 : Array.Empty<RuntimeSceneInstance>();
+            if (worldPersistentReplacementFrom.IsValid &&
+                !replacedInstances.Any(
+                    candidate => candidate.InstanceId == worldPersistentReplacementFrom))
+            {
+                return FailActivation(
+                    instance,
+                    $"[RuntimeSceneService] World-owned persistent replacement lost expected " +
+                    $"instance '{worldPersistentReplacementFrom}' before activation.");
+            }
             if (replacedInstances.Length > 0
                 && !TryValidateUnloadReferences(replacedInstances, out string unloadDiagnostic))
             {
@@ -699,6 +1199,14 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                     out string ownershipDiagnostic))
             {
                 return FailActivation(instance, ownershipDiagnostic);
+            }
+
+            if (!SceneStagingValidation.TryValidateActivation(
+                    staging,
+                    activationContext,
+                    out string activationDiagnostic))
+            {
+                return FailActivation(instance, activationDiagnostic);
             }
 
             if (!TryValidateComponentOwnerships(
@@ -726,7 +1234,9 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 : DestroyInstances(
                     entityManager,
                     replacedInstances,
-                    "[RuntimeSceneService] Scene instance was unloaded by controlled scene replacement.");
+                    "[RuntimeSceneService] Scene instance was unloaded by controlled scene replacement.",
+                    worldPersistentReplacementFrom);
+            replacementDestroyed = replacedInstances.Length > 0;
 
             instance.Name = result.SceneName;
             instance.SourcePath = result.SourcePath;
@@ -773,6 +1283,14 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                         instance.InstanceId);
                     Volatile.Write(ref m_ActiveScene, activeState);
                 }
+
+                if (worldPersistentReplacementFrom.IsValid &&
+                    m_WorldOwnedPersistentInstanceId == worldPersistentReplacementFrom)
+                {
+                    // Transfer world ownership only after the replacement's ECS,
+                    // component ownership, and ActiveScene state are committed.
+                    m_WorldOwnedPersistentInstanceId = instance.InstanceId;
+                }
             }
 
             for (int i = 0; i < unloadedSnapshots.Length; i++)
@@ -804,6 +1322,17 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 for (int i = activatedEntities.Length - 1; i >= 0; i--)
                 {
                     entityManager.TryDestroyEntity(activatedEntities[i]);
+                }
+            }
+
+            if (replacementDestroyed && worldPersistentReplacementFrom.IsValid)
+            {
+                lock (m_Gate)
+                {
+                    if (m_WorldOwnedPersistentInstanceId == worldPersistentReplacementFrom)
+                    {
+                        m_WorldOwnedPersistentInstanceId = RuntimeSceneInstanceId.Invalid;
+                    }
                 }
             }
 
@@ -895,7 +1424,8 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
     private RuntimeSceneInstanceSnapshot[] DestroyInstances(
         EntityManager entityManager,
         RuntimeSceneInstance[] instances,
-        string diagnostic)
+        string diagnostic,
+        RuntimeSceneInstanceId worldPersistentReplacementFrom = default)
     {
         int entityCount = 0;
         for (int i = 0; i < instances.Length; i++)
@@ -948,6 +1478,17 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
                 {
                     Volatile.Write(ref m_ActiveScene, null);
                     activeScene = null;
+                }
+
+                if (m_WorldOwnedPersistentInstanceId == instance.InstanceId)
+                {
+                    // Keep the old world claim through replacement destruction. The
+                    // replacement transfers ownership only after its structural
+                    // commit has completed in ActivateInstance.
+                    if (!worldPersistentReplacementFrom.IsValid)
+                    {
+                        m_WorldOwnedPersistentInstanceId = RuntimeSceneInstanceId.Invalid;
+                    }
                 }
             }
         }
@@ -1127,6 +1668,63 @@ public sealed class RuntimeSceneService : IRuntimeSceneService
         while (m_Diagnostics.Count > MaxDiagnostics)
         {
             m_Diagnostics.Dequeue();
+        }
+    }
+
+    private SceneOperationScope EnterSceneOperation(string operation)
+    {
+        int threadId = Environment.CurrentManagedThreadId;
+        lock (m_OperationGate)
+        {
+            if (m_OperationOwnerThreadId == threadId)
+            {
+                throw new InvalidOperationException(
+                    $"[RuntimeSceneService] Scene operation '{operation}' cannot run reentrantly " +
+                    $"while '{m_ActiveOperation}' is active.");
+            }
+
+            while (m_OperationOwnerThreadId != 0)
+            {
+                Monitor.Wait(m_OperationGate);
+            }
+
+            m_OperationOwnerThreadId = threadId;
+            m_ActiveOperation = operation;
+        }
+
+        return new SceneOperationScope(this, threadId);
+    }
+
+    private void ExitSceneOperation(int threadId)
+    {
+        lock (m_OperationGate)
+        {
+            if (m_OperationOwnerThreadId != threadId)
+            {
+                throw new InvalidOperationException(
+                    "[RuntimeSceneService] Scene operation ownership was released by a non-owning thread.");
+            }
+
+            m_OperationOwnerThreadId = 0;
+            m_ActiveOperation = string.Empty;
+            Monitor.PulseAll(m_OperationGate);
+        }
+    }
+
+    private readonly struct SceneOperationScope : IDisposable
+    {
+        private readonly RuntimeSceneService m_Owner;
+        private readonly int m_ThreadId;
+
+        public SceneOperationScope(RuntimeSceneService owner, int threadId)
+        {
+            m_Owner = owner;
+            m_ThreadId = threadId;
+        }
+
+        public void Dispose()
+        {
+            m_Owner.ExitSceneOperation(m_ThreadId);
         }
     }
 

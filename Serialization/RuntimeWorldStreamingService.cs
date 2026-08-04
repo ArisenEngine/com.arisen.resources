@@ -129,16 +129,31 @@ public readonly record struct RuntimeWorldLoadResult(
     bool Success,
     Guid WorldGuid,
     int CellCount,
-    string Diagnostic);
+    string Diagnostic)
+{
+    /// <summary>
+    /// True when the world descriptor and persistent scene were staged successfully, but
+    /// activation is waiting for frame-boundary residency preparation.
+    /// </summary>
+    public bool Deferred { get; init; }
+}
+
+public readonly record struct RuntimeWorldPresentationSnapshot(
+    long Revision,
+    AssetRef<WorldSourceAsset>? ActiveWorldAsset,
+    AssetRef<WorldSourceAsset>? PendingWorldAsset,
+    Guid ActiveWorldGuid);
 
 public interface IRuntimeWorldStreamingService
 {
     WorldDescriptor? ActiveWorld { get; }
     AssetRef<WorldSourceAsset>? ActiveWorldAsset { get; }
+    RuntimeWorldPresentationSnapshot PresentationSnapshot { get; }
     WorldStreamingBudgets Budgets { get; }
 
     event Action<WorldCellStreamingSnapshot>? CellStateChanged;
     event Action<AssetRef<WorldSourceAsset>?>? ActiveWorldChanged;
+    event Action<RuntimeWorldPresentationSnapshot>? WorldPresentationChanged;
 
     bool TryConfigureBudgets(WorldStreamingBudgets budgets, out string diagnostic);
     RuntimeWorldLoadResult LoadWorld(AssetRef<WorldSourceAsset> world);
@@ -164,6 +179,28 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         WorldStreamingSubscriberFailure Diagnostic,
         Exception Error);
 
+    private sealed class PendingPersistentSceneReplacement
+    {
+        public required long RequestSequence { get; init; }
+        public required long ResidencyGeneration { get; init; }
+        public required AssetRef<SceneSourceAsset> Scene { get; init; }
+        public required SceneSourceSnapshot? Snapshot { get; init; }
+        public SceneStagingData? Staging { get; set; }
+        public string SourceKind { get; set; } = string.Empty;
+        public RuntimeAssetResidencyLease? ResidencyLease { get; set; }
+    }
+
+    private sealed class PendingWorldLoad
+    {
+        public required AssetRef<WorldSourceAsset> World { get; init; }
+        public required WorldDescriptor Descriptor { get; init; }
+        public required AssetRef<SceneSourceAsset> PersistentScene { get; init; }
+        public required SceneStagingData Staging { get; init; }
+        public required string SourceKind { get; init; }
+        public required RuntimeAssetResidencyLease ResidencyLease { get; init; }
+    }
+
+    private readonly object m_LifecycleGate = new();
     private readonly object m_Gate = new();
     private readonly IAssetDatabase m_AssetDatabase;
     private readonly RuntimeSceneService m_SceneService;
@@ -179,6 +216,13 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
     private WorldPosition m_StreamingSource;
     private bool m_HasStreamingSource;
     private bool m_ShuttingDown;
+    private int m_LifecycleOwnerThreadId;
+    private int m_LifecycleWaiterCount;
+    private string m_ActiveLifecycleOperation = string.Empty;
+    private long m_NextActivationClaim;
+    private long m_NextPersistentReplacementRequest;
+    private long m_NextPersistentResidencyGeneration;
+    private long m_WorldPresentationRevision;
     private long m_NextTransitionSequence;
     private long m_NextDiagnosticSequence;
     private long m_BytesInFlight;
@@ -195,6 +239,12 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
     private double m_LastActivationMilliseconds;
     private double m_LastUnloadMilliseconds;
     private RuntimeAssetResidencyLease? m_PersistentResidencyLease;
+    private RuntimeSceneInstanceId m_PersistentSceneInstanceId;
+    private PendingPersistentSceneReplacement? m_PendingPersistentReplacement;
+    private PendingWorldLoad? m_PendingWorldLoad;
+    private AssetRef<WorldSourceAsset>? m_PendingWorldPresentationAsset;
+    private bool m_PersistentSceneUnloadBlocked;
+    private string m_PersistentSceneDiagnostic = string.Empty;
 
     public RuntimeWorldStreamingService(
         IAssetDatabase assetDatabase,
@@ -231,6 +281,8 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         m_OriginService = originService ?? new WorldOriginService();
         Budgets = budgets ?? WorldStreamingBudgets.Default;
         Budgets.Validate();
+        m_SceneService.SetWorldPersistentSceneReplacementHandler(
+            QueuePersistentSceneReplacement);
     }
 
     public WorldDescriptor? ActiveWorld
@@ -249,12 +301,53 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         }
     }
 
+    public RuntimeWorldPresentationSnapshot PresentationSnapshot
+    {
+        get
+        {
+            lock (m_Gate) return CreateWorldPresentationSnapshotLocked();
+        }
+    }
+
     public WorldStreamingBudgets Budgets { get; private set; }
 
     public IRuntimeAssetResidencyService Residency => m_ResidencyService;
 
+    internal bool IsShuttingDown
+    {
+        get
+        {
+            lock (m_Gate) return m_ShuttingDown;
+        }
+    }
+
+    internal bool PersistentSceneUnloadBlocked
+    {
+        get
+        {
+            lock (m_Gate) return m_PersistentSceneUnloadBlocked;
+        }
+    }
+
+    internal string PersistentSceneDiagnostic
+    {
+        get
+        {
+            lock (m_Gate) return m_PersistentSceneDiagnostic;
+        }
+    }
+
+    internal int PendingLifecycleOperationCount
+    {
+        get
+        {
+            lock (m_LifecycleGate) return m_LifecycleWaiterCount;
+        }
+    }
+
     public event Action<WorldCellStreamingSnapshot>? CellStateChanged;
     public event Action<AssetRef<WorldSourceAsset>?>? ActiveWorldChanged;
+    public event Action<RuntimeWorldPresentationSnapshot>? WorldPresentationChanged;
 
     public bool TryConfigureBudgets(WorldStreamingBudgets budgets, out string diagnostic)
     {
@@ -282,13 +375,16 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
 
     public RuntimeWorldLoadResult LoadWorld(AssetRef<WorldSourceAsset> world)
     {
+        using LifecycleOperationScope lifecycle = EnterLifecycleOperation(nameof(LoadWorld));
         List<CapturedSubscriberFailure>? subscriberFailures = null;
+        m_SceneService.BeginWorldLifecycleMutation();
         try
         {
             return LoadWorldCore(world, ref subscriberFailures);
         }
         finally
         {
+            m_SceneService.EndWorldLifecycleMutation();
             ReportSubscriberFailures(nameof(LoadWorld), subscriberFailures);
         }
     }
@@ -302,56 +398,79 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             return new RuntimeWorldLoadResult(false, Guid.Empty, 0, "World asset ref is empty.");
         }
 
-        ShutdownCore(unloadActiveCells: true, ref subscriberFailures);
+        BeginWorldPresentationRequest(world, ref subscriberFailures);
+
+        if (!ShutdownCore(
+                true,
+                world,
+                ref subscriberFailures,
+                out string shutdownDiagnostic))
+        {
+            lock (m_Gate) m_ShuttingDown = false;
+            RuntimeWorldLoadResult failure = new(
+                false,
+                world.Guid,
+                0,
+                $"Existing world shutdown failed: {shutdownDiagnostic}");
+            ClearWorldPresentationRequest(world, ref subscriberFailures);
+            return failure;
+        }
         WorldDescriptorLoadResult loaded = m_AssetDatabase.CanReadSourceAssets
             ? WorldDescriptorLoader.LoadSource(m_AssetDatabase, world)
             : WorldAssetCooker.LoadCooked(m_AssetDatabase, world);
         if (!loaded.Success || loaded.Descriptor == null)
         {
             lock (m_Gate) m_ShuttingDown = false;
+            ClearWorldPresentationRequest(world, ref subscriberFailures);
             return new RuntimeWorldLoadResult(false, world.Guid, 0, loaded.Diagnostic);
         }
 
         WorldDescriptor descriptor = loaded.Descriptor;
         m_OriginService.ConfigureForWorld(descriptor.Partition);
-        SceneLoadResult persistent = m_SceneService.LoadScene(new AssetRef<SceneSourceAsset>(
+        AssetRef<SceneSourceAsset> persistentScene = new(
             descriptor.PersistentScene.Guid,
             "Scene",
-            descriptor.PersistentScene.PackageId));
-        if (!persistent.Success)
+            descriptor.PersistentScene.PackageId);
+        SceneStagingData persistentStaging;
+        string stagingDiagnostic;
+        bool staged = m_AssetDatabase.CanReadSourceAssets
+            ? SceneAssetLoader.TryLoadSceneStaging(
+                m_AssetDatabase,
+                persistentScene,
+                out persistentStaging,
+                out stagingDiagnostic)
+            : SceneAssetCooker.TryLoadCookedStaging(
+                m_AssetDatabase,
+                persistentScene,
+                out persistentStaging,
+                out stagingDiagnostic);
+        string persistentSourceKind = m_AssetDatabase.CanReadSourceAssets ? "source" : "cooked";
+        if (!staged)
         {
             lock (m_Gate) m_ShuttingDown = false;
-            return new RuntimeWorldLoadResult(false, world.Guid, 0, persistent.Diagnostic);
-        }
-
-        RuntimeSceneState persistentState = m_SceneService.ActiveScene
-            ?? throw new InvalidOperationException(
-                "A successful persistent world-scene load did not publish an active scene state.");
-        if (!m_SceneService.TryGetSceneInstance(
-                persistentState.InstanceId,
-                out RuntimeSceneInstanceSnapshot persistentSnapshot))
-        {
-            m_SceneService.UnloadSceneAtFrameBoundary(persistentState.InstanceId, out _);
-            lock (m_Gate) m_ShuttingDown = false;
-            return new RuntimeWorldLoadResult(
-                false,
-                world.Guid,
-                0,
-                "Persistent world-scene dependencies were unavailable after activation.");
+            ClearWorldPresentationRequest(world, ref subscriberFailures);
+            return new RuntimeWorldLoadResult(false, world.Guid, 0, stagingDiagnostic);
         }
 
         RuntimeAssetResidencyLease persistentLease;
+        long persistentResidencyGeneration;
+        lock (m_Gate)
+        {
+            persistentResidencyGeneration = ++m_NextPersistentResidencyGeneration;
+        }
         try
         {
             persistentLease = m_ResidencyService.AcquireSceneDependencies(
-                RuntimeAssetResidencyOwnerId.Persistent(descriptor.WorldGuid),
-                persistentSnapshot.Dependencies,
+                RuntimeAssetResidencyOwnerId.Persistent(
+                    descriptor.WorldGuid,
+                    persistentResidencyGeneration),
+                SceneAssetCooker.GetDependencies(persistentStaging),
                 pinned: true);
         }
         catch (Exception ex)
         {
-            m_SceneService.UnloadSceneAtFrameBoundary(persistentState.InstanceId, out _);
             lock (m_Gate) m_ShuttingDown = false;
+            ClearWorldPresentationRequest(world, ref subscriberFailures);
             return new RuntimeWorldLoadResult(
                 false,
                 world.Guid,
@@ -359,22 +478,461 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 $"Persistent world-scene residency acquisition failed: {ex.Message}");
         }
 
+        if (persistentLease.State != RuntimePreparedAssetState.Ready)
+        {
+            string residencyDiagnostic = persistentLease.Diagnostic;
+            RuntimePreparedAssetState state = persistentLease.State;
+            if (state == RuntimePreparedAssetState.Waiting)
+            {
+                lock (m_Gate)
+                {
+                    m_PendingWorldLoad = new PendingWorldLoad
+                    {
+                        World = world,
+                        Descriptor = descriptor,
+                        PersistentScene = persistentScene,
+                        Staging = persistentStaging,
+                        SourceKind = persistentSourceKind,
+                        ResidencyLease = persistentLease
+                    };
+                    m_ShuttingDown = false;
+                }
+                m_SceneService.SetWorldPersistentStartupPending(true);
+
+                return new RuntimeWorldLoadResult(
+                    true,
+                    descriptor.WorldGuid,
+                    descriptor.Cells.Count,
+                    $"Persistent world-scene residency is waiting for frame-boundary preparation. " +
+                    residencyDiagnostic)
+                {
+                    Deferred = true
+                };
+            }
+
+            persistentLease.Dispose();
+            lock (m_Gate) m_ShuttingDown = false;
+            ClearWorldPresentationRequest(world, ref subscriberFailures);
+            return new RuntimeWorldLoadResult(
+                false,
+                world.Guid,
+                0,
+                $"Persistent world-scene residency is {state} after bounded setup: " +
+                residencyDiagnostic);
+        }
+
+        RuntimeSceneInstanceId persistentInstanceId;
+        SceneLoadResult persistent;
+        try
+        {
+            (persistentInstanceId, persistent) =
+                m_SceneService.ActivatePreparedPersistentAtLifecycleBoundary(
+                    persistentScene,
+                    persistentStaging,
+                    persistentSourceKind);
+        }
+        catch (Exception ex)
+        {
+            persistentLease.Dispose();
+            lock (m_Gate) m_ShuttingDown = false;
+            ClearWorldPresentationRequest(world, ref subscriberFailures);
+            return new RuntimeWorldLoadResult(
+                false,
+                world.Guid,
+                0,
+                $"Persistent world-scene activation failed: {ex.Message}");
+        }
+
+        if (!persistent.Success)
+        {
+            RuntimeWorldLoadResult failure = FailPersistentSceneLoad(
+                world,
+                descriptor,
+                persistentScene,
+                persistentInstanceId,
+                persistentLease,
+                $"Persistent world-scene activation failed: {persistent.Diagnostic}");
+            ClearWorldPresentationRequest(world, ref subscriberFailures);
+            return failure;
+        }
+
+        if (!m_SceneService.TryGetSceneInstance(
+                persistentInstanceId,
+                out RuntimeSceneInstanceSnapshot persistentSnapshot) ||
+            persistentSnapshot.State != RuntimeSceneInstanceState.Active ||
+            persistentSnapshot.Kind != RuntimeSceneInstanceKind.Persistent ||
+            !IsSameScene(persistentSnapshot.Scene, persistentScene))
+        {
+            string identityDiagnostic =
+                $"Persistent world-scene activation did not leave the requested active instance " +
+                $"'{persistentInstanceId}'.";
+            RuntimeWorldLoadResult failure = FailPersistentSceneLoad(
+                world,
+                descriptor,
+                persistentScene,
+                persistentInstanceId,
+                persistentLease,
+                identityDiagnostic);
+            ClearWorldPresentationRequest(world, ref subscriberFailures);
+            return failure;
+        }
+
+        RuntimeWorldPresentationSnapshot activePresentationSnapshot;
         lock (m_Gate)
         {
             ResetCountersLocked();
             m_ActiveWorld = descriptor;
             m_ActiveWorldAsset = world;
             m_PersistentResidencyLease = persistentLease;
+            m_PersistentSceneInstanceId = persistentInstanceId;
+            m_PersistentSceneUnloadBlocked = false;
+            m_PersistentSceneDiagnostic = string.Empty;
+            m_PendingWorldPresentationAsset = null;
             m_ShuttingDown = false;
             foreach (WorldCellDescriptor cell in descriptor.Cells)
             {
                 m_Cells.Add(cell.Id, new RuntimeCell(cell));
             }
+            activePresentationSnapshot = AdvanceWorldPresentationLocked();
         }
 
         PlotMetrics();
+        PublishWorldPresentationChanged(
+            activePresentationSnapshot,
+            ref subscriberFailures);
         PublishActiveWorldChanged(world, ref subscriberFailures);
         return new RuntimeWorldLoadResult(true, descriptor.WorldGuid, descriptor.Cells.Count, string.Empty);
+    }
+
+    private void BeginWorldPresentationRequest(
+        AssetRef<WorldSourceAsset> world,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
+        RuntimeWorldPresentationSnapshot presentationSnapshot;
+        lock (m_Gate)
+        {
+            m_PendingWorldPresentationAsset = world;
+            presentationSnapshot = AdvanceWorldPresentationLocked();
+        }
+
+        PublishWorldPresentationChanged(presentationSnapshot, ref subscriberFailures);
+    }
+
+    private void ClearWorldPresentationRequest(
+        AssetRef<WorldSourceAsset> world,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
+        RuntimeWorldPresentationSnapshot presentationSnapshot = default;
+        bool cleared = false;
+        lock (m_Gate)
+        {
+            if (m_PendingWorldPresentationAsset == world)
+            {
+                m_PendingWorldPresentationAsset = null;
+                presentationSnapshot = AdvanceWorldPresentationLocked();
+                cleared = true;
+            }
+        }
+
+        if (cleared)
+        {
+            PublishWorldPresentationChanged(presentationSnapshot, ref subscriberFailures);
+        }
+    }
+
+    private RuntimeWorldLoadResult FailPersistentSceneLoad(
+        AssetRef<WorldSourceAsset> world,
+        WorldDescriptor descriptor,
+        AssetRef<SceneSourceAsset> expectedScene,
+        RuntimeSceneInstanceId instanceId,
+        RuntimeAssetResidencyLease persistentLease,
+        string failureDiagnostic)
+    {
+        bool retained = false;
+        string cleanupDiagnostic = string.Empty;
+        if (instanceId.IsValid &&
+            m_SceneService.TryGetSceneInstance(
+                instanceId,
+                out RuntimeSceneInstanceSnapshot snapshot) &&
+            snapshot.Kind == RuntimeSceneInstanceKind.Persistent &&
+            IsSameScene(snapshot.Scene, expectedScene))
+        {
+            if (snapshot.State == RuntimeSceneInstanceState.Active)
+            {
+                bool unloaded = m_SceneService.UnloadSceneAtWorldLifecycleBoundary(
+                    instanceId,
+                    out cleanupDiagnostic);
+                retained = !unloaded;
+            }
+            else if (snapshot.State == RuntimeSceneInstanceState.QueuedForUnload)
+            {
+                retained = true;
+                cleanupDiagnostic =
+                    $"Persistent scene '{instanceId}' remains queued for unload and still owns ECS state.";
+            }
+        }
+
+        string diagnostic = failureDiagnostic;
+        bool releaseLease = !retained;
+        lock (m_Gate)
+        {
+            m_ShuttingDown = false;
+            if (retained)
+            {
+                m_SceneService.SetWorldPersistentRollbackBlocked(true);
+                m_PersistentSceneInstanceId = instanceId;
+                m_PersistentResidencyLease = persistentLease;
+                m_PersistentSceneUnloadBlocked = true;
+                m_PersistentSceneDiagnostic =
+                    $"World '{descriptor.WorldGuid:D}' retained persistent scene " +
+                    $"'{instanceId}' after rollback rejection: {cleanupDiagnostic}";
+                diagnostic = $"{failureDiagnostic} {m_PersistentSceneDiagnostic}";
+            }
+            else
+            {
+                m_SceneService.SetWorldPersistentRollbackBlocked(false);
+                m_PersistentSceneInstanceId = RuntimeSceneInstanceId.Invalid;
+                m_PersistentResidencyLease = null;
+                m_PersistentSceneUnloadBlocked = false;
+                m_PersistentSceneDiagnostic = string.Empty;
+            }
+        }
+
+        if (releaseLease)
+        {
+            persistentLease.Dispose();
+        }
+
+        return new RuntimeWorldLoadResult(false, world.Guid, 0, diagnostic);
+    }
+
+    private void QueuePersistentSceneReplacement(
+        AssetRef<SceneSourceAsset> scene,
+        SceneSourceSnapshot? snapshot)
+    {
+        using LifecycleOperationScope lifecycle =
+            EnterLifecycleOperation("QueuePersistentSceneReplacement");
+        RuntimeAssetResidencyLease? supersededLease;
+        lock (m_Gate)
+        {
+            if (m_ShuttingDown || m_ActiveWorld == null ||
+                !m_ActiveWorldAsset.HasValue ||
+                !m_PersistentSceneInstanceId.IsValid)
+            {
+                throw new InvalidOperationException(
+                    "Persistent scene preview requires a fully active world lifecycle owner.");
+            }
+
+            AssetRef<SceneSourceAsset> expectedScene = new(
+                m_ActiveWorld.PersistentScene.Guid,
+                "Scene",
+                m_ActiveWorld.PersistentScene.PackageId);
+            if (!IsSameScene(expectedScene, scene))
+            {
+                throw new InvalidOperationException(
+                    "Persistent scene preview must target the active world's persistent scene.");
+            }
+
+            supersededLease = m_PendingPersistentReplacement?.ResidencyLease;
+            m_PendingPersistentReplacement = new PendingPersistentSceneReplacement
+            {
+                RequestSequence = ++m_NextPersistentReplacementRequest,
+                ResidencyGeneration = ++m_NextPersistentResidencyGeneration,
+                Scene = scene,
+                Snapshot = snapshot
+            };
+        }
+
+        supersededLease?.Dispose();
+    }
+
+    private void PreparePendingPersistentReplacement()
+    {
+        PendingPersistentSceneReplacement? pending;
+        WorldDescriptor? activeWorld;
+        lock (m_Gate)
+        {
+            pending = m_PendingPersistentReplacement;
+            activeWorld = m_ActiveWorld;
+            if (pending == null || pending.ResidencyLease != null || activeWorld == null)
+            {
+                return;
+            }
+        }
+
+        SceneStagingData staging;
+        string stagingDiagnostic;
+        bool staged = pending.Snapshot != null
+            ? SceneAssetLoader.TryLoadSceneStaging(
+                m_AssetDatabase,
+                pending.Snapshot,
+                out staging,
+                out stagingDiagnostic)
+            : m_AssetDatabase.CanReadSourceAssets
+                ? SceneAssetLoader.TryLoadSceneStaging(
+                    m_AssetDatabase,
+                    pending.Scene,
+                    out staging,
+                    out stagingDiagnostic)
+                : SceneAssetCooker.TryLoadCookedStaging(
+                    m_AssetDatabase,
+                    pending.Scene,
+                    out staging,
+                    out stagingDiagnostic);
+        if (!staged)
+        {
+            FailPendingPersistentReplacement(pending, stagingDiagnostic, publishFailure: true);
+            return;
+        }
+
+        RuntimeAssetResidencyLease replacementLease;
+        try
+        {
+            replacementLease = m_ResidencyService.AcquireSceneDependencies(
+                RuntimeAssetResidencyOwnerId.Persistent(
+                    activeWorld.WorldGuid,
+                    pending.ResidencyGeneration),
+                SceneAssetCooker.GetDependencies(staging),
+                pinned: true);
+        }
+        catch (Exception ex)
+        {
+            FailPendingPersistentReplacement(
+                pending,
+                $"Persistent scene preview residency acquisition failed: {ex.Message}",
+                publishFailure: true);
+            return;
+        }
+
+        lock (m_Gate)
+        {
+            if (!ReferenceEquals(m_PendingPersistentReplacement, pending))
+            {
+                replacementLease.Dispose();
+                return;
+            }
+
+            pending.Staging = staging;
+            pending.SourceKind = pending.Snapshot != null || m_AssetDatabase.CanReadSourceAssets
+                ? "source"
+                : "cooked";
+            pending.ResidencyLease = replacementLease;
+        }
+    }
+
+    private void ActivateReadyPersistentReplacement()
+    {
+        PendingPersistentSceneReplacement? pending;
+        RuntimeSceneInstanceId expectedInstanceId;
+        lock (m_Gate)
+        {
+            pending = m_PendingPersistentReplacement;
+            expectedInstanceId = m_PersistentSceneInstanceId;
+            if (pending?.ResidencyLease == null || pending.Staging == null)
+            {
+                return;
+            }
+        }
+
+        RuntimePreparedAssetState residencyState = pending.ResidencyLease.State;
+        if (residencyState == RuntimePreparedAssetState.Waiting)
+        {
+            return;
+        }
+        if (residencyState == RuntimePreparedAssetState.Failed)
+        {
+            FailPendingPersistentReplacement(
+                pending,
+                $"Persistent scene preview residency preparation failed: " +
+                pending.ResidencyLease.Diagnostic,
+                publishFailure: true);
+            return;
+        }
+
+        (RuntimeSceneInstanceId replacementInstanceId, SceneLoadResult result) =
+            m_SceneService.ActivatePreparedWorldPersistentReplacementAtLifecycleBoundary(
+                expectedInstanceId,
+                pending.Scene,
+                pending.Snapshot,
+                pending.Staging,
+                pending.SourceKind);
+        if (!result.Success)
+        {
+            FailPendingPersistentReplacement(
+                pending,
+                result.Diagnostic,
+                publishFailure: false);
+            return;
+        }
+
+        if (!m_SceneService.TryGetSceneInstance(
+                replacementInstanceId,
+                out RuntimeSceneInstanceSnapshot replacementSnapshot) ||
+            replacementSnapshot.State != RuntimeSceneInstanceState.Active ||
+            replacementSnapshot.Kind != RuntimeSceneInstanceKind.Persistent ||
+            !IsSameScene(replacementSnapshot.Scene, pending.Scene))
+        {
+            throw new InvalidOperationException(
+                $"Persistent scene preview activation did not publish exact active instance " +
+                $"'{replacementInstanceId}'.");
+        }
+
+        RuntimeAssetResidencyLease? previousLease;
+        lock (m_Gate)
+        {
+            if (!ReferenceEquals(m_PendingPersistentReplacement, pending) ||
+                m_PersistentSceneInstanceId != expectedInstanceId)
+            {
+                throw new InvalidOperationException(
+                    "Persistent scene preview ownership changed during its lifecycle transaction.");
+            }
+
+            previousLease = m_PersistentResidencyLease;
+            m_PersistentResidencyLease = pending.ResidencyLease;
+            m_PersistentSceneInstanceId = replacementInstanceId;
+            pending.ResidencyLease = null;
+            m_PendingPersistentReplacement = null;
+            m_PersistentSceneUnloadBlocked = false;
+            m_PersistentSceneDiagnostic = string.Empty;
+        }
+
+        previousLease?.Dispose();
+    }
+
+    private void FailPendingPersistentReplacement(
+        PendingPersistentSceneReplacement pending,
+        string diagnostic,
+        bool publishFailure)
+    {
+        RuntimeAssetResidencyLease? failedLease;
+        lock (m_Gate)
+        {
+            if (!ReferenceEquals(m_PendingPersistentReplacement, pending))
+            {
+                return;
+            }
+
+            failedLease = pending.ResidencyLease;
+            pending.ResidencyLease = null;
+            m_PendingPersistentReplacement = null;
+        }
+
+        failedLease?.Dispose();
+        if (publishFailure)
+        {
+            m_SceneService.ReportWorldPersistentReplacementFailure(
+                pending.Scene,
+                pending.Snapshot,
+                diagnostic);
+        }
+    }
+
+    private static bool IsSameScene(
+        AssetRef<SceneSourceAsset> left,
+        AssetRef<SceneSourceAsset> right)
+    {
+        return left.Guid == right.Guid &&
+               string.Equals(left.PackageId, right.PackageId, StringComparison.OrdinalIgnoreCase);
     }
 
     public void SetStreamingSource(WorldPosition position)
@@ -497,6 +1055,13 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 cell.Diagnostic = "Cell reload requested.";
                 changes.Add(SnapshotLocked(cell));
             }
+            else if (cell.ActivationClaim != 0)
+            {
+                cell.ReloadRequested = true;
+                cell.Diagnostic =
+                    "Claimed cell activation was superseded by a reload and will be discarded.";
+                changes.Add(SnapshotLocked(cell));
+            }
             else if (cell.Task is { IsCompleted: false })
             {
                 cell.RequestGeneration++;
@@ -606,35 +1171,72 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         lock (m_Gate) return BuildMetricsLocked();
     }
 
-    internal void ProcessAtFrameBoundary()
+    internal SceneLoadResult? ProcessAtFrameBoundary()
     {
+        using LifecycleOperationScope lifecycle =
+            EnterLifecycleOperation(nameof(ProcessAtFrameBoundary));
         List<CapturedSubscriberFailure>? subscriberFailures = null;
+        SceneLoadResult? pendingSceneResult = null;
         try
         {
             ProcessAtFrameBoundaryCore(ref subscriberFailures);
+            pendingSceneResult = m_SceneService.ProcessPendingSceneLoadAtFrameBoundary();
         }
         finally
         {
             ReportSubscriberFailures(nameof(ProcessAtFrameBoundary), subscriberFailures);
         }
+
+        return pendingSceneResult;
     }
 
     private void ProcessAtFrameBoundaryCore(
         ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
         using var _ = Profiler.Zone("WorldStreaming.FrameBoundary");
+        bool hasPendingWorldLoad;
+        bool cleanupOnly;
+        lock (m_Gate)
+        {
+            if (m_ShuttingDown) return;
+            hasPendingWorldLoad = m_PendingWorldLoad != null;
+            cleanupOnly = m_ActiveWorld == null && !hasPendingWorldLoad;
+        }
+
+        if (cleanupOnly)
+        {
+            // Deferred activation may have released its final lease after the prior
+            // frame's setup pass. This owner-thread sweep evicts those inactive
+            // resources without reopening activation or admitting world work.
+            m_ResidencyService.ProcessAtFrameBoundary();
+            return;
+        }
+
+        if (hasPendingWorldLoad)
+        {
+            // The sole provider setup pass for this engine frame. Deferred startup has no
+            // active cell work yet, so activation can consume this pass directly.
+            m_ResidencyService.ProcessAtFrameBoundary();
+            ActivatePendingWorldLoad(ref subscriberFailures);
+        }
+
         lock (m_Gate)
         {
             if (m_ActiveWorld == null || m_ShuttingDown) return;
         }
 
+        PreparePendingPersistentReplacement();
         if (m_SceneService.ActiveScene is { EntityManager: { } entityManager })
         {
             m_OriginService.ProcessAtFrameBoundary(entityManager);
         }
         PlanDesiredCells(ref subscriberFailures);
         ProcessCompletedReads(ref subscriberFailures);
-        m_ResidencyService.ProcessAtFrameBoundary();
+        if (!hasPendingWorldLoad)
+        {
+            m_ResidencyService.ProcessAtFrameBoundary();
+        }
+        ActivateReadyPersistentReplacement();
         ProcessWaitingResources(ref subscriberFailures);
         AdmitQueuedReads(ref subscriberFailures);
         UnloadUndesiredCells(ref subscriberFailures);
@@ -642,39 +1244,197 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         PlotMetrics();
     }
 
-    internal void Shutdown(bool unloadActiveCells)
+    private void ActivatePendingWorldLoad(
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
     {
-        List<CapturedSubscriberFailure>? subscriberFailures = null;
+        PendingWorldLoad? pending;
+        lock (m_Gate)
+        {
+            pending = m_PendingWorldLoad;
+            if (pending == null || m_ShuttingDown)
+            {
+                return;
+            }
+        }
+
+        RuntimePreparedAssetState state = pending.ResidencyLease.State;
+        if (state == RuntimePreparedAssetState.Waiting)
+        {
+            return;
+        }
+
+        if (state == RuntimePreparedAssetState.Failed)
+        {
+            string diagnostic = pending.ResidencyLease.Diagnostic;
+            pending.ResidencyLease.Dispose();
+            ClearPendingWorldLoad(pending, ref subscriberFailures);
+            throw new InvalidOperationException(
+                $"Persistent world-scene residency preparation failed for deferred world " +
+                $"'{pending.World.Guid:D}': {diagnostic}");
+        }
+
+        RuntimeSceneInstanceId persistentInstanceId;
+        SceneLoadResult persistent;
+        RuntimeWorldPresentationSnapshot activePresentationSnapshot = default;
+        m_SceneService.BeginWorldLifecycleMutation();
         try
         {
-            ShutdownCore(unloadActiveCells, ref subscriberFailures);
+            try
+            {
+                (persistentInstanceId, persistent) =
+                    m_SceneService.ActivatePreparedPersistentAtLifecycleBoundary(
+                        pending.PersistentScene,
+                        pending.Staging,
+                        pending.SourceKind);
+            }
+            catch
+            {
+                pending.ResidencyLease.Dispose();
+                ClearPendingWorldLoad(pending, ref subscriberFailures);
+                throw;
+            }
+
+            bool identityValid = persistent.Success &&
+                m_SceneService.TryGetSceneInstance(
+                    persistentInstanceId,
+                    out RuntimeSceneInstanceSnapshot persistentSnapshot) &&
+                persistentSnapshot.State == RuntimeSceneInstanceState.Active &&
+                persistentSnapshot.Kind == RuntimeSceneInstanceKind.Persistent &&
+                IsSameScene(persistentSnapshot.Scene, pending.PersistentScene);
+            bool ownershipValid;
+            lock (m_Gate) ownershipValid = ReferenceEquals(m_PendingWorldLoad, pending);
+            if (!identityValid || !ownershipValid)
+            {
+                RuntimeWorldLoadResult rollback = FailPersistentSceneLoad(
+                    pending.World,
+                    pending.Descriptor,
+                    pending.PersistentScene,
+                    persistentInstanceId,
+                    pending.ResidencyLease,
+                    !persistent.Success
+                        ? $"Deferred persistent world-scene activation failed: {persistent.Diagnostic}"
+                        : !identityValid
+                            ? $"Deferred persistent world-scene activation did not publish exact active " +
+                              $"instance '{persistentInstanceId}'."
+                            : "Deferred persistent world load ownership changed during activation.");
+                ClearPendingWorldLoad(pending, ref subscriberFailures);
+                throw new InvalidOperationException(rollback.Diagnostic);
+            }
+
+            lock (m_Gate)
+            {
+                ResetCountersLocked();
+                m_ActiveWorld = pending.Descriptor;
+                m_ActiveWorldAsset = pending.World;
+                m_PersistentResidencyLease = pending.ResidencyLease;
+                m_PersistentSceneInstanceId = persistentInstanceId;
+                m_PersistentSceneUnloadBlocked = false;
+                m_PersistentSceneDiagnostic = string.Empty;
+                m_ShuttingDown = false;
+                m_PendingWorldLoad = null;
+                m_PendingWorldPresentationAsset = null;
+                foreach (WorldCellDescriptor cell in pending.Descriptor.Cells)
+                {
+                    m_Cells.Add(cell.Id, new RuntimeCell(cell));
+                }
+                activePresentationSnapshot = AdvanceWorldPresentationLocked();
+            }
+
+            m_SceneService.SetWorldPersistentStartupPending(false);
         }
         finally
         {
+            m_SceneService.EndWorldLifecycleMutation();
+        }
+
+        PlotMetrics();
+        PublishWorldPresentationChanged(
+            activePresentationSnapshot,
+            ref subscriberFailures);
+        PublishActiveWorldChanged(pending.World, ref subscriberFailures);
+    }
+
+    private void ClearPendingWorldLoad(
+        PendingWorldLoad pending,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
+        bool detached = false;
+        RuntimeWorldPresentationSnapshot presentationSnapshot = default;
+        lock (m_Gate)
+        {
+            if (ReferenceEquals(m_PendingWorldLoad, pending))
+            {
+                m_PendingWorldLoad = null;
+                m_PendingWorldPresentationAsset = null;
+                m_ShuttingDown = false;
+                detached = true;
+                presentationSnapshot = AdvanceWorldPresentationLocked();
+            }
+        }
+
+        if (detached)
+        {
+            m_SceneService.SetWorldPersistentStartupPending(false);
+            PublishWorldPresentationChanged(
+                presentationSnapshot,
+                ref subscriberFailures);
+        }
+    }
+
+    internal void Shutdown(bool unloadActiveCells)
+    {
+        using LifecycleOperationScope lifecycle = EnterLifecycleOperation(nameof(Shutdown));
+        List<CapturedSubscriberFailure>? subscriberFailures = null;
+        m_SceneService.BeginWorldLifecycleMutation();
+        try
+        {
+            if (!ShutdownCore(
+                    unloadActiveCells,
+                    null,
+                    ref subscriberFailures,
+                    out string diagnostic))
+            {
+                throw new InvalidOperationException(
+                    $"Runtime world streaming shutdown failed: {diagnostic}");
+            }
+        }
+        finally
+        {
+            m_SceneService.EndWorldLifecycleMutation();
             ReportSubscriberFailures(nameof(Shutdown), subscriberFailures);
         }
     }
 
-    private void ShutdownCore(
+    private bool ShutdownCore(
         bool unloadActiveCells,
-        ref List<CapturedSubscriberFailure>? subscriberFailures)
+        AssetRef<WorldSourceAsset>? replacementPresentation,
+        ref List<CapturedSubscriberFailure>? subscriberFailures,
+        out string diagnostic)
     {
         BackgroundTask<CellPayloadLoadResult>[] tasks;
-        RuntimeCell[] activeCells;
-        bool publishWorldClosed;
+        bool publishActiveWorldClosed;
+        RuntimeWorldPresentationSnapshot? presentationSnapshot;
         lock (m_Gate)
         {
             m_ShuttingDown = true;
+        }
+
+        if (unloadActiveCells)
+        {
+            if (!m_SceneService.UnloadAllScenesAtWorldLifecycleBoundary(out diagnostic))
+            {
+                lock (m_Gate) m_ShuttingDown = false;
+                return false;
+            }
+        }
+
+        lock (m_Gate)
+        {
             tasks = m_Cells.Values
                 .Where(cell => cell.Task != null)
                 .Select(cell => cell.Task!)
                 .ToArray();
             foreach (BackgroundTask<CellPayloadLoadResult> task in tasks) task.Cancel();
-            activeCells = m_Cells.Values
-                .Where(cell => cell.State == WorldCellStreamingState.Active)
-                .OrderByDescending(cell => cell.Descriptor.Dependencies.Count)
-                .ThenByDescending(cell => cell.Descriptor.Id)
-                .ToArray();
         }
 
         foreach (BackgroundTask<CellPayloadLoadResult> task in tasks)
@@ -686,46 +1446,118 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             }
         }
 
-        if (unloadActiveCells)
-        {
-            foreach (RuntimeCell cell in activeCells)
-            {
-                m_SceneService.UnloadSceneAtFrameBoundary(cell.SceneInstanceId, out _);
-            }
-
-            if (m_SceneService.ActiveScene is { InstanceId.IsValid: true } persistent)
-            {
-                m_SceneService.UnloadSceneAtFrameBoundary(persistent.InstanceId, out _);
-            }
-        }
-
         RuntimeAssetResidencyLease[] leases;
         RuntimeAssetResidencyLease? persistentLease;
+        RuntimeAssetResidencyLease? pendingPersistentLease;
+        RuntimeAssetResidencyLease? pendingWorldLease;
         lock (m_Gate)
         {
+            publishActiveWorldClosed = m_ActiveWorld != null || m_ActiveWorldAsset.HasValue;
+            bool publishPresentationChanged =
+                publishActiveWorldClosed ||
+                m_PendingWorldPresentationAsset != replacementPresentation;
             leases = m_Cells.Values
                 .Where(cell => cell.ResidencyLease != null)
                 .Select(cell => cell.ResidencyLease!)
                 .ToArray();
             persistentLease = m_PersistentResidencyLease;
+            pendingPersistentLease = m_PendingPersistentReplacement?.ResidencyLease;
+            pendingWorldLease = m_PendingWorldLoad?.ResidencyLease;
             m_PersistentResidencyLease = null;
+            m_PendingPersistentReplacement = null;
+            m_PendingWorldLoad = null;
+            m_PendingWorldPresentationAsset = replacementPresentation;
+            m_PersistentSceneInstanceId = RuntimeSceneInstanceId.Invalid;
+            m_PersistentSceneUnloadBlocked = false;
+            m_PersistentSceneDiagnostic = string.Empty;
             m_Cells.Clear();
             m_PendingWorkerNotifications.Clear();
-            publishWorldClosed = m_ActiveWorld != null || m_ActiveWorldAsset.HasValue;
             m_ActiveWorld = null;
             m_ActiveWorldAsset = null;
             m_HasStreamingSource = false;
             m_BytesInFlight = 0;
             m_ReservedStagingBytes = 0;
             m_DecodedStagingBytes = 0;
+            presentationSnapshot = publishPresentationChanged
+                ? AdvanceWorldPresentationLocked()
+                : null;
         }
 
-        foreach (RuntimeAssetResidencyLease lease in leases) lease.Dispose();
-        persistentLease?.Dispose();
-        m_ResidencyService.ProcessAtFrameBoundary();
-        if (publishWorldClosed)
+        if (presentationSnapshot.HasValue)
+        {
+            PublishWorldPresentationChanged(
+                presentationSnapshot.Value,
+                ref subscriberFailures);
+        }
+        if (publishActiveWorldClosed)
         {
             PublishActiveWorldChanged(null, ref subscriberFailures);
+        }
+
+        var cleanupFailures = new List<Exception>();
+        foreach (RuntimeAssetResidencyLease lease in leases)
+        {
+            TryWorldCleanup(
+                "cell residency lease release",
+                lease.Dispose,
+                cleanupFailures);
+        }
+        if (persistentLease != null)
+        {
+            TryWorldCleanup(
+                "persistent residency lease release",
+                persistentLease.Dispose,
+                cleanupFailures);
+        }
+        if (pendingPersistentLease != null)
+        {
+            TryWorldCleanup(
+                "pending persistent residency lease release",
+                pendingPersistentLease.Dispose,
+                cleanupFailures);
+        }
+        if (pendingWorldLease != null)
+        {
+            TryWorldCleanup(
+                "pending world residency lease release",
+                pendingWorldLease.Dispose,
+                cleanupFailures);
+        }
+        TryWorldCleanup(
+            "persistent-scene admission reset",
+            () => m_SceneService.SetWorldPersistentStartupPending(false),
+            cleanupFailures);
+        TryWorldCleanup(
+            "residency frame-boundary cleanup",
+            m_ResidencyService.ProcessAtFrameBoundary,
+            cleanupFailures);
+
+        if (cleanupFailures.Count > 0)
+        {
+            diagnostic = new AggregateException(
+                "World streaming post-state cleanup failed.",
+                cleanupFailures).Message;
+            return false;
+        }
+
+        diagnostic = string.Empty;
+        return true;
+    }
+
+    private static void TryWorldCleanup(
+        string stage,
+        Action cleanup,
+        ICollection<Exception> failures)
+    {
+        try
+        {
+            cleanup();
+        }
+        catch (Exception error)
+        {
+            failures.Add(new InvalidOperationException(
+                $"World streaming failed to complete {stage}.",
+                error));
         }
     }
 
@@ -759,7 +1591,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 RuntimeCell[] cameraCandidates = m_Cells.Values
                     .Where(cell =>
                     {
-                        bool activeLike = cell.State is
+                        bool activeLike = cell.ActivationClaim != 0 || cell.State is
                             WorldCellStreamingState.Active or
                             WorldCellStreamingState.QueuedToUnload or
                             WorldCellStreamingState.Unloading;
@@ -834,7 +1666,18 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 }
 
                 bool transitioned = false;
-                if (cell.Task != null && !cell.Task.IsCompleted)
+                if (cell.ActivationClaim != 0)
+                {
+                    if (selectionChanged)
+                    {
+                        m_CancellationCount++;
+                        cell.Diagnostic =
+                            "Claimed cell activation will be discarded because the cell left the desired set.";
+                        changes.Add(SnapshotLocked(cell));
+                    }
+                    transitioned = true;
+                }
+                else if (cell.Task != null && !cell.Task.IsCompleted)
                 {
                     cell.RequestGeneration++;
                     cell.Task.Cancel();
@@ -1157,10 +2000,17 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                Stopwatch.GetElapsedTime(started).TotalMilliseconds < Budgets.MaxActivationMilliseconds)
         {
             RuntimeCell? cell;
+            long activationClaim = 0;
+            SceneStagingData? stagedScene = null;
+            string sourceKind = string.Empty;
+            WorldDescriptor? activeWorld = null;
             lock (m_Gate)
             {
+                if (m_ShuttingDown || m_ActiveWorld == null) break;
+
                 int activeCount = m_Cells.Values.Count(candidate =>
-                    candidate.State == WorldCellStreamingState.Active);
+                    candidate.State == WorldCellStreamingState.Active ||
+                    candidate.ActivationClaim != 0);
                 int desiredCount = m_Cells.Values.Count(candidate => candidate.Desired);
                 int activeLimit = Math.Max(m_ActiveWorld!.Partition.MaxActiveCells, desiredCount);
                 if (activeCount >= activeLimit)
@@ -1175,6 +2025,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 cell = m_Cells.Values
                     .Where(candidate =>
                         candidate.State == WorldCellStreamingState.ReadyToActivate &&
+                        candidate.ActivationClaim == 0 &&
                         candidate.Descriptor.Dependencies.All(dependency =>
                             m_Cells[dependency].State == WorldCellStreamingState.Active))
                     .OrderBy(candidate => candidate.Pinned ? 0 : 1)
@@ -1183,6 +2034,16 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                         : int.MaxValue)
                     .ThenBy(candidate => candidate.Descriptor.Id)
                     .FirstOrDefault();
+                if (cell != null)
+                {
+                    activationClaim = ++m_NextActivationClaim;
+                    cell.ActivationClaim = activationClaim;
+                    stagedScene = cell.Staging
+                        ?? throw new InvalidOperationException(
+                            $"Ready world cell '{cell.Descriptor.Id}' has no staged scene payload.");
+                    sourceKind = cell.SourceKind;
+                    activeWorld = m_ActiveWorld;
+                }
             }
 
             if (cell == null) break;
@@ -1194,30 +2055,39 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 cell.Descriptor.Scene.PackageId);
             long activationStarted = Stopwatch.GetTimestamp();
             SceneStagingData placedStaging;
+            WorldPosition cellOrigin;
             try
             {
-                WorldDescriptor activeWorld;
-                lock (m_Gate) activeWorld = m_ActiveWorld!;
+                cellOrigin = WorldPartitionCoordinates.GetCellOrigin(
+                    activeWorld!.Partition,
+                    cell.Descriptor.Key.Coordinate);
                 placedStaging = SceneStagingPlacement.PlaceCell(
-                    cell.Staging!,
-                    WorldPartitionCoordinates.GetCellOrigin(
-                        activeWorld.Partition,
-                        cell.Descriptor.Key.Coordinate),
+                    stagedScene!,
+                    cellOrigin,
                     m_OriginService.CurrentOrigin);
             }
             catch (Exception ex)
             {
-                WorldCellStreamingSnapshot failed;
+                var changes = new List<WorldCellStreamingSnapshot>(2);
                 lock (m_Gate)
                 {
-                    m_FailureCount++;
-                    cell.Diagnostic = $"Cell placement failed: {ex.Message}";
-                    ReleaseStagingLocked(cell);
-                    ReleaseResidencyLocked(cell);
-                    failed = TransitionLocked(cell, WorldCellStreamingState.Failed);
-                    AddDiagnosticLocked(cell);
+                    EnsureActivationClaimLocked(cell, activationClaim);
+                    if (IsActivationSupersededLocked(cell))
+                    {
+                        CompleteSupersededActivationLocked(
+                            cell,
+                            $"Superseded cell activation was discarded after placement failed: {ex.Message}",
+                            changes);
+                    }
+                    else
+                    {
+                        CompleteFailedActivationLocked(
+                            cell,
+                            $"Cell placement failed: {ex.Message}",
+                            changes);
+                    }
                 }
-                Publish(failed, ref subscriberFailures);
+                Publish(changes, ref subscriberFailures);
                 activated++;
                 continue;
             }
@@ -1225,35 +2095,147 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             var activation = m_SceneService.ActivatePreparedAdditiveAtFrameBoundary(
                 scene,
                 placedStaging,
-                cell.SourceKind,
-                cell.Descriptor.Id);
+                sourceKind,
+                new SceneComponentActivationContext(
+                    cell.Descriptor.Id,
+                    cellOrigin,
+                    cell.Descriptor.Bounds));
             double activationMilliseconds = Stopwatch.GetElapsedTime(activationStarted).TotalMilliseconds;
-            WorldCellStreamingSnapshot changed;
+            var activationChanges = new List<WorldCellStreamingSnapshot>(2);
+            bool unloadSupersededInstance = false;
             lock (m_Gate)
             {
+                EnsureActivationClaimLocked(cell, activationClaim);
                 m_LastActivationMilliseconds = activationMilliseconds;
                 if (activation.Result.Success)
                 {
                     cell.SceneInstanceId = activation.InstanceId;
-                    cell.UnloadBlocked = false;
-                    cell.Diagnostic = activation.Result.Diagnostic;
-                    ReleaseStagingLocked(cell);
-                    changed = TransitionLocked(cell, WorldCellStreamingState.Active);
+                    if (IsActivationSupersededLocked(cell))
+                    {
+                        unloadSupersededInstance = true;
+                    }
+                    else
+                    {
+                        ReleaseActivationClaimLocked(cell);
+                        cell.UnloadBlocked = false;
+                        cell.Diagnostic = activation.Result.Diagnostic;
+                        ReleaseStagingLocked(cell);
+                        activationChanges.Add(TransitionLocked(
+                            cell,
+                            WorldCellStreamingState.Active));
+                    }
+                }
+                else if (IsActivationSupersededLocked(cell))
+                {
+                    CompleteSupersededActivationLocked(
+                        cell,
+                        "Superseded cell activation was discarded after scene activation rejected the payload.",
+                        activationChanges);
                 }
                 else
                 {
-                    m_FailureCount++;
-                    cell.Diagnostic = activation.Result.Diagnostic;
-                    ReleaseStagingLocked(cell);
-                    ReleaseResidencyLocked(cell);
-                    changed = TransitionLocked(cell, WorldCellStreamingState.Failed);
-                    AddDiagnosticLocked(cell);
+                    CompleteFailedActivationLocked(
+                        cell,
+                        activation.Result.Diagnostic,
+                        activationChanges);
                 }
             }
 
-            Publish(changed, ref subscriberFailures);
+            if (unloadSupersededInstance)
+            {
+                long unloadStarted = Stopwatch.GetTimestamp();
+                bool unloaded = m_SceneService.UnloadSceneAtFrameBoundary(
+                    activation.InstanceId,
+                    out string unloadDiagnostic);
+                double unloadMilliseconds = Stopwatch.GetElapsedTime(unloadStarted).TotalMilliseconds;
+                lock (m_Gate)
+                {
+                    EnsureActivationClaimLocked(cell, activationClaim);
+                    m_LastUnloadMilliseconds = unloadMilliseconds;
+                    if (unloaded)
+                    {
+                        CompleteSupersededActivationLocked(
+                            cell,
+                            "Superseded cell activation was unloaded before its staging and residency ownership were released.",
+                            activationChanges);
+                    }
+                    else
+                    {
+                        ReleaseActivationClaimLocked(cell);
+                        cell.UnloadBlocked = true;
+                        cell.ReloadRequested = true;
+                        cell.Diagnostic =
+                            $"Superseded cell activation could not be unloaded and remains owned: {unloadDiagnostic}";
+                        ReleaseStagingLocked(cell);
+                        m_FailureCount++;
+                        activationChanges.Add(TransitionLocked(
+                            cell,
+                            WorldCellStreamingState.Active));
+                        AddDiagnosticLocked(cell);
+                    }
+                }
+            }
+
+            Publish(activationChanges, ref subscriberFailures);
             activated++;
         }
+    }
+
+    private static void EnsureActivationClaimLocked(RuntimeCell cell, long activationClaim)
+    {
+        if (activationClaim == 0 || cell.ActivationClaim != activationClaim ||
+            cell.State != WorldCellStreamingState.ReadyToActivate)
+        {
+            throw new InvalidOperationException(
+                $"World cell '{cell.Descriptor.Id}' lost activation claim {activationClaim} while activation owned its staging and residency.");
+        }
+    }
+
+    private bool IsActivationSupersededLocked(RuntimeCell cell) =>
+        m_ShuttingDown || cell.ReloadRequested || !cell.Desired;
+
+    private void ReleaseActivationClaimLocked(RuntimeCell cell)
+    {
+        if (cell.ActivationClaim == 0)
+        {
+            throw new InvalidOperationException(
+                $"World cell '{cell.Descriptor.Id}' has no activation claim to release.");
+        }
+
+        cell.ActivationClaim = 0;
+    }
+
+    private void CompleteSupersededActivationLocked(
+        RuntimeCell cell,
+        string diagnostic,
+        List<WorldCellStreamingSnapshot> changes)
+    {
+        ReleaseActivationClaimLocked(cell);
+        cell.SceneInstanceId = RuntimeSceneInstanceId.Invalid;
+        cell.UnloadBlocked = false;
+        cell.ReloadRequested = false;
+        cell.Diagnostic = diagnostic;
+        ReleaseStagingLocked(cell);
+        ReleaseResidencyLocked(cell);
+        changes.Add(TransitionLocked(cell, WorldCellStreamingState.Cancelled));
+        if (!m_ShuttingDown && (cell.Desired || cell.Pinned))
+        {
+            changes.Add(TransitionLocked(cell, WorldCellStreamingState.Queued));
+        }
+    }
+
+    private void CompleteFailedActivationLocked(
+        RuntimeCell cell,
+        string diagnostic,
+        List<WorldCellStreamingSnapshot> changes)
+    {
+        ReleaseActivationClaimLocked(cell);
+        m_FailureCount++;
+        cell.Diagnostic = diagnostic;
+        ReleaseStagingLocked(cell);
+        ReleaseResidencyLocked(cell);
+        changes.Add(TransitionLocked(cell, WorldCellStreamingState.Failed));
+        AddDiagnosticLocked(cell);
     }
 
     private void UnloadUndesiredCells(ref List<CapturedSubscriberFailure>? subscriberFailures)
@@ -1566,6 +2548,43 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         }
     }
 
+    private void PublishWorldPresentationChanged(
+        RuntimeWorldPresentationSnapshot snapshot,
+        ref List<CapturedSubscriberFailure>? subscriberFailures)
+    {
+        Action<RuntimeWorldPresentationSnapshot>? handlers = WorldPresentationChanged;
+        if (handlers == null) return;
+
+        Delegate[] subscribers = handlers.GetInvocationList();
+        for (int index = 0; index < subscribers.Length; index++)
+        {
+            var subscriber = (Action<RuntimeWorldPresentationSnapshot>)subscribers[index];
+            try
+            {
+                subscriber(snapshot);
+            }
+            catch (Exception error)
+            {
+                CaptureSubscriberFailure(
+                    "WorldPresentationChanged",
+                    $"Revision={snapshot.Revision}, " +
+                    $"Active={FormatWorldPresentationAsset(snapshot.ActiveWorldAsset)}, " +
+                    $"Pending={FormatWorldPresentationAsset(snapshot.PendingWorldAsset)}, " +
+                    $"ActiveWorldGuid={snapshot.ActiveWorldGuid:D}",
+                    index,
+                    subscriber,
+                    error,
+                    ref subscriberFailures);
+            }
+        }
+    }
+
+    private static string FormatWorldPresentationAsset(
+        AssetRef<WorldSourceAsset>? world) =>
+        world is { } value
+            ? $"{value.Guid:D}/{value.PackageId}"
+            : "<none>";
+
     private static void CaptureSubscriberFailure(
         string notification,
         string payload,
@@ -1662,6 +2681,18 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         m_LastUnloadMilliseconds = 0;
     }
 
+    private RuntimeWorldPresentationSnapshot AdvanceWorldPresentationLocked()
+    {
+        m_WorldPresentationRevision = checked(m_WorldPresentationRevision + 1);
+        return CreateWorldPresentationSnapshotLocked();
+    }
+
+    private RuntimeWorldPresentationSnapshot CreateWorldPresentationSnapshotLocked() => new(
+        m_WorldPresentationRevision,
+        m_ActiveWorldAsset,
+        m_PendingWorldPresentationAsset,
+        m_ActiveWorld?.WorldGuid ?? Guid.Empty);
+
     private static int ChebyshevDistance(WorldCellCoordinate left, WorldCellCoordinate right)
     {
         long x = Math.Abs((long)left.X - right.X);
@@ -1694,6 +2725,84 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         return Math.Max(inFlightBytes, cell.EstimatedCpuBytes);
     }
 
+    private LifecycleOperationScope EnterLifecycleOperation(string operation)
+    {
+        // Residency callbacks can be waiting on an operation that already owns the
+        // world lifecycle gate. Reject callback reentry before joining that wait.
+        m_ResidencyService.EnsureWorldLifecycleMutationAllowed();
+        int threadId = Environment.CurrentManagedThreadId;
+        // Scene lifecycle notifications are published while the scene operation
+        // gate is owned. Reject same-thread observer reentry before waiting on a
+        // world lifecycle operation held by that scene operation.
+        if (m_SceneService.IsSceneOperationOwnedByCurrentThread)
+        {
+            throw new InvalidOperationException(
+                $"World-streaming lifecycle operation '{operation}' cannot run reentrantly " +
+                "from a scene lifecycle observer.");
+        }
+
+        lock (m_LifecycleGate)
+        {
+            if (m_LifecycleOwnerThreadId == threadId)
+            {
+                throw new InvalidOperationException(
+                    $"World-streaming lifecycle operation '{operation}' cannot run reentrantly " +
+                    $"while '{m_ActiveLifecycleOperation}' is active.");
+            }
+
+            m_LifecycleWaiterCount++;
+            try
+            {
+                while (m_LifecycleOwnerThreadId != 0)
+                {
+                    Monitor.Wait(m_LifecycleGate);
+                }
+
+                m_LifecycleOwnerThreadId = threadId;
+                m_ActiveLifecycleOperation = operation;
+            }
+            finally
+            {
+                m_LifecycleWaiterCount--;
+            }
+        }
+
+        return new LifecycleOperationScope(this, threadId);
+    }
+
+    private void ExitLifecycleOperation(int threadId)
+    {
+        lock (m_LifecycleGate)
+        {
+            if (m_LifecycleOwnerThreadId != threadId)
+            {
+                throw new InvalidOperationException(
+                    "World-streaming lifecycle ownership was released by a non-owning thread.");
+            }
+
+            m_LifecycleOwnerThreadId = 0;
+            m_ActiveLifecycleOperation = string.Empty;
+            Monitor.PulseAll(m_LifecycleGate);
+        }
+    }
+
+    private readonly struct LifecycleOperationScope : IDisposable
+    {
+        private readonly RuntimeWorldStreamingService m_Owner;
+        private readonly int m_ThreadId;
+
+        public LifecycleOperationScope(RuntimeWorldStreamingService owner, int threadId)
+        {
+            m_Owner = owner;
+            m_ThreadId = threadId;
+        }
+
+        public void Dispose()
+        {
+            m_Owner.ExitLifecycleOperation(m_ThreadId);
+        }
+    }
+
     private sealed class RuntimeCell
     {
         public RuntimeCell(WorldCellDescriptor descriptor)
@@ -1705,6 +2814,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         public WorldCellStreamingState State { get; set; } = WorldCellStreamingState.Unloaded;
         public long RequestGeneration { get; set; }
         public long ScheduledGeneration { get; set; }
+        public long ActivationClaim { get; set; }
         public long TransitionSequence { get; set; }
         public bool Desired { get; set; }
         public WorldCellDesiredSource DesiredSources { get; set; }

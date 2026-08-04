@@ -10,6 +10,22 @@ public readonly record struct SceneComponentReadContext(
     Guid EntityGuid,
     string DiagnosticPath);
 
+public readonly record struct SceneComponentActivationContext(
+    WorldCellId WorldCellId,
+    WorldPosition CellOrigin,
+    WorldBounds CellBounds)
+{
+    public bool HasWorldCell => WorldCellId.IsValid;
+}
+
+public interface ISceneComponentExtensionActivationValidator
+{
+    bool TryValidateActivation(
+        in SceneComponentActivationContext context,
+        object component,
+        out string diagnostic);
+}
+
 public interface ISceneComponentExtensionCodec
 {
     SceneComponentSchemaInfo Schema { get; }

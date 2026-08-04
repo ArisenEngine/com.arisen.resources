@@ -134,12 +134,23 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
     public void Start(uint initialFrameIndex)
     {
         m_LastFrameIndex = initialFrameIndex;
-        m_World = m_Streaming.ActiveWorld
-            ?? throw new InvalidOperationException(
-                "World-streaming smoke requires an active startup world.");
-        m_EntityManager = m_Scenes.ActiveScene?.EntityManager
-            ?? throw new InvalidOperationException(
-                "World-streaming smoke requires an active persistent scene.");
+        if (!TryBeginAfterStartupWorldReady(initialFrameIndex))
+        {
+            m_Stage = WorldStreamingSmokeStage.AwaitStartupWorld;
+        }
+    }
+
+    private bool TryBeginAfterStartupWorldReady(uint frameIndex)
+    {
+        WorldDescriptor? world = m_Streaming.ActiveWorld;
+        EntityManager? entityManager = m_Scenes.ActiveScene?.EntityManager;
+        if (world == null || entityManager == null)
+        {
+            return false;
+        }
+
+        m_World = world;
+        m_EntityManager = entityManager;
 
         SelectValidationCells(m_World);
         ConfigureValidationBudgets();
@@ -152,8 +163,9 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         m_Origin.RebaseStarting += OnRebaseStarting;
         m_Origin.Rebased += OnRebased;
 
-        ScheduleVisualCapture("before", checked(initialFrameIndex + 1));
+        ScheduleVisualCapture("before", checked(frameIndex + 1));
         m_Stage = WorldStreamingSmokeStage.AwaitBeforeCapture;
+        return true;
     }
 
     public void BeforeFrame(uint frameIndex)
@@ -166,6 +178,12 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         if (m_ReadyForShutdown) return;
         using var _ = Profiler.Zone("WorldStreamingSmoke.AfterFrame");
         m_LastFrameIndex = frameIndex;
+        if (m_Stage == WorldStreamingSmokeStage.AwaitStartupWorld)
+        {
+            TryBeginAfterStartupWorldReady(frameIndex);
+            return;
+        }
+
         UpdatePeaks();
         ValidateHardBudgets();
         ValidateOriginStability();
@@ -985,6 +1003,7 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 internal enum WorldStreamingSmokeStage
 {
     None,
+    AwaitStartupWorld,
     AwaitBeforeCapture,
     AwaitInitialPlan,
     AwaitCancellationAndPrimary,

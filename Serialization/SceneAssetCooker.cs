@@ -240,6 +240,61 @@ internal static class SceneStagingValidation
         return true;
     }
 
+    public static bool TryValidateActivation(
+        SceneStagingData staging,
+        in SceneComponentActivationContext context,
+        out string diagnostic)
+    {
+        for (int entityIndex = 0; entityIndex < staging.Entities.Length; entityIndex++)
+        {
+            ref readonly SceneStagingEntity entity = ref staging.Entities[entityIndex];
+            SceneStagedExtensionComponent[] extensions = entity.ExtensionComponents
+                ?? Array.Empty<SceneStagedExtensionComponent>();
+            for (int componentIndex = 0; componentIndex < extensions.Length; componentIndex++)
+            {
+                ref readonly SceneStagedExtensionComponent extension = ref extensions[componentIndex];
+                if (extension.Codec is not ISceneComponentExtensionActivationValidator validator)
+                {
+                    continue;
+                }
+
+                bool valid;
+                string componentDiagnostic;
+                try
+                {
+                    valid = validator.TryValidateActivation(
+                        context,
+                        extension.Value,
+                        out componentDiagnostic!);
+                }
+                catch (Exception ex)
+                {
+                    valid = false;
+                    componentDiagnostic = ex.Message;
+                }
+
+                if (valid)
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(componentDiagnostic))
+                {
+                    componentDiagnostic = "the component rejected its activation context";
+                }
+
+                diagnostic =
+                    $"[SceneStaging] Scene '{staging.DiagnosticPath}' entity " +
+                    $"'{entity.AuthoringGuid:D}' component '{extension.Codec.Schema.Name}' " +
+                    $"activation validation failed: {componentDiagnostic}.";
+                return false;
+            }
+        }
+
+        diagnostic = string.Empty;
+        return true;
+    }
+
     private static bool IsFinite(System.Numerics.Vector3 value)
     {
         return float.IsFinite(value.X) && float.IsFinite(value.Y) && float.IsFinite(value.Z);
