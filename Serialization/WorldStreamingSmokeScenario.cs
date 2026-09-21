@@ -239,12 +239,14 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
             case WorldStreamingSmokeStage.AwaitShadowFarCapture:
                 if (VisualCaptureCompleted("shadow-far"))
                 {
+                    PinStationaryAnimationClock();
                     BeginShadowFarStableCapture(frameIndex);
                 }
                 break;
             case WorldStreamingSmokeStage.AwaitShadowFarStableCapture:
                 if (VisualCaptureCompleted("shadow-far-stable"))
                 {
+                    Time.Unpin();
                     BeginAfterCapture(frameIndex);
                 }
                 break;
@@ -269,6 +271,7 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
     public void ReportFailure(string message)
     {
         if (string.IsNullOrWhiteSpace(message)) message = "Unknown world-streaming smoke failure.";
+        Time.Unpin();
         m_FailureMessage ??= message;
         m_Context.VisualSummaryService?.Seal();
         m_ReadyForShutdown = true;
@@ -277,6 +280,7 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 
     public void AfterShutdown()
     {
+        Time.Unpin();
         m_Streaming.CellStateChanged -= OnCellStateChanged;
         m_Origin.RebaseStarting -= OnRebaseStarting;
         m_Origin.Rebased -= OnRebased;
@@ -594,6 +598,18 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         {
             m_Stage = WorldStreamingSmokeStage.AwaitShadowFarStableCapture;
         }
+    }
+
+    /// <summary>
+    /// The stationary-stability pair renders the same camera on two consecutive frames and
+    /// requires byte-identical color and depth output. Time-driven content such as vegetation
+    /// wind legitimately advances between frames, so the validation clock is pinned to the time
+    /// the reference frame rendered with. Any remaining difference is then real
+    /// non-determinism rather than expected animation progress.
+    /// </summary>
+    private static void PinStationaryAnimationClock()
+    {
+        Time.Pin(Time.elapsedTime);
     }
 
     private void BeginAfterCapture(uint frameIndex)
