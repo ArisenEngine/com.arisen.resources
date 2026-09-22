@@ -94,6 +94,7 @@ public sealed record WorldStreamingMetrics(
     long FailureCount,
     long StaleCompletionCount,
     long BudgetStallCount,
+    long DeferredResidencyCount,
     double LastLoadLatencyMilliseconds,
     double LastActivationMilliseconds,
     double LastUnloadMilliseconds,
@@ -235,6 +236,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
     private long m_SubscriberFailureCount;
     private long m_StaleCompletionCount;
     private long m_BudgetStallCount;
+    private long m_DeferredResidencyCount;
     private double m_LastLoadLatencyMilliseconds;
     private double m_LastActivationMilliseconds;
     private double m_LastUnloadMilliseconds;
@@ -1764,6 +1766,22 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                     continue;
                 }
 
+                if (result.ResidencyCleanupPending)
+                {
+                    string deferralDiagnostic = result.ResidencyCleanupPendingDiagnostic;
+                    result.Dispose();
+                    m_DeferredResidencyCount++;
+                    cell.Diagnostic = deferralDiagnostic;
+                    changes.Add(TransitionLocked(cell, WorldCellStreamingState.Cancelled));
+                    if (cell.Desired || cell.Pinned)
+                    {
+                        changes.Add(TransitionLocked(cell, WorldCellStreamingState.Queued));
+                    }
+
+                    AddDiagnosticLocked(cell);
+                    continue;
+                }
+
                 if (!cell.Desired)
                 {
                     result.Dispose();
@@ -1982,6 +2000,17 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
                 pinned,
                 cancellationToken);
             result.AttachResidencyLease(lease);
+            return result;
+        }
+        catch (RuntimeAssetResidencyCleanupPendingException pending)
+        {
+            // A required dependency of this cell was released by an earlier generation of the same
+            // cell and is still completing the deterministic cleanup that only the frame boundary
+            // drives forward. Blocking this worker until that boundary would deadlock the very frame
+            // the read has to finish in, and failing the read would strand the cell because nothing
+            // retries a failed load. The validated payload is therefore handed back with the reason
+            // recorded, so the frame boundary can re-queue the cell once the key is reusable again.
+            result.MarkResidencyCleanupPending(pending.Message);
             return result;
         }
         catch
@@ -2448,6 +2477,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
             m_FailureCount,
             m_StaleCompletionCount,
             m_BudgetStallCount,
+            m_DeferredResidencyCount,
             m_LastLoadLatencyMilliseconds,
             m_LastActivationMilliseconds,
             m_LastUnloadMilliseconds,
@@ -2473,6 +2503,7 @@ public sealed class RuntimeWorldStreamingService : IRuntimeWorldStreamingService
         Profiler.PlotValue("WorldStreaming.SubscriberFailures", metrics.SubscriberFailureCount);
         Profiler.PlotValue("WorldStreaming.StaleCompletions", metrics.StaleCompletionCount);
         Profiler.PlotValue("WorldStreaming.BudgetStalls", metrics.BudgetStallCount);
+        Profiler.PlotValue("WorldStreaming.DeferredResidency", metrics.DeferredResidencyCount);
         Profiler.PlotValue("WorldStreaming.LastLoadLatencyMs", metrics.LastLoadLatencyMilliseconds);
         Profiler.PlotValue("WorldStreaming.LastActivationMs", metrics.LastActivationMilliseconds);
         Profiler.PlotValue("WorldStreaming.LastUnloadMs", metrics.LastUnloadMilliseconds);
@@ -2857,6 +2888,22 @@ internal sealed class CellPayloadLoadResult : IDisposable
     public string SourceKind { get; }
     public long PayloadBytes { get; }
     public long StagingBytes { get; }
+
+    /// <summary>
+    /// True when the payload was read and validated but a required dependency could not be acquired
+    /// because an earlier generation of the same owner is still completing its deterministic
+    /// cleanup. The condition is resolved by the frame boundary, so the owner defers the request and
+    /// retries it instead of failing.
+    /// </summary>
+    public bool ResidencyCleanupPending { get; private set; }
+
+    public string ResidencyCleanupPendingDiagnostic { get; private set; } = string.Empty;
+
+    public void MarkResidencyCleanupPending(string diagnostic)
+    {
+        ResidencyCleanupPending = true;
+        ResidencyCleanupPendingDiagnostic = diagnostic;
+    }
 
     public void AttachResidencyLease(RuntimeAssetResidencyLease lease)
     {

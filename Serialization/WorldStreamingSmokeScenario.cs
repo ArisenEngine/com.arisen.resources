@@ -63,7 +63,16 @@ internal sealed class WorldStreamingSmokeScenarioProvider : IRuntimeSmokeScenari
 internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 {
     private const int SoakCycleCount = 4;
-    private const float MidShadowCameraRetreat = 20.0f;
+    // The shadow captures stand on the authored viewer pose so their cascades frame what a player
+    // sees, and the outdoor-atmosphere gate reads a distance-haze progression across the near, mid,
+    // and far ones: pulling the camera back has to brighten the frame. That reading only holds while
+    // every derived pose stands clear of the region's vegetation, because a pose inside a canopy
+    // fills the frame with near foliage and inverts the progression. The authored view direction
+    // runs through a grove between 18 and 34 world units behind the camera, so the middle sample
+    // steps past it rather than into it: at 40 units the pose carries the canopy share the authored
+    // pose has - 19 percent of the frame occluded closer than 20 m, against the authored pose's 19
+    // percent and the far pose's 11 percent - and the retreat samples stay 40 and 64 units out.
+    private const float MidShadowCameraRetreat = 40.0f;
     private const float FarShadowCameraRetreat = 64.0f;
 
     private readonly RuntimeSmokeScenarioContext m_Context;
@@ -84,7 +93,8 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
     private WorldCellDescriptor? m_PrimaryCell;
     private WorldCellDescriptor? m_CancellationCell;
     private WorldCellDescriptor? m_FailureCell;
-    private WorldPosition m_NearSource;
+    private WorldPosition m_AdmissionSource;
+    private WorldPosition m_ViewSource;
     private WorldPosition m_CancellationSource;
     private WorldPosition m_FarSource;
     private Entity m_ValidationCamera;
@@ -155,10 +165,7 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         SelectValidationCells(m_World);
         ConfigureValidationBudgets();
         CapturePersistentWorldPositions();
-        if (m_Context.VisualSummaryService != null)
-        {
-            CaptureValidationCamera();
-        }
+        CaptureValidationCamera();
         m_Streaming.CellStateChanged += OnCellStateChanged;
         m_Origin.RebaseStarting += OnRebaseStarting;
         m_Origin.Rebased += OnRebased;
@@ -203,6 +210,9 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
                 break;
             case WorldStreamingSmokeStage.AwaitCancellationAndPrimary:
                 ObserveCancellationAndPrimary(frameIndex);
+                break;
+            case WorldStreamingSmokeStage.AwaitDuringSettle:
+                ObserveDuringSettle(frameIndex);
                 break;
             case WorldStreamingSmokeStage.AwaitDuringCapture:
                 if (VisualCaptureCompleted("during")) BeginFirstUnload();
@@ -342,35 +352,65 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 
         long largestNormalEstimate = ordered[^2].EstimatedCpuBytes;
         WorldCellDescriptor failure = ordered[^1];
-        WorldCellDescriptor[] normals = ordered
-            .Where(cell => cell.EstimatedCpuBytes <= largestNormalEstimate)
-            .OrderBy(cell => Math.Abs(cell.Key.Coordinate.X))
-            .ThenBy(cell => cell.Id)
-            .Take(2)
-            .ToArray();
-        if (normals.Length != 2 || failure.EstimatedCpuBytes <= largestNormalEstimate)
+        if (failure.EstimatedCpuBytes <= largestNormalEstimate)
         {
             throw new InvalidOperationException(
-                "World-streaming smoke requires two normal cells and one cell with a larger CPU estimate.");
+                "World-streaming smoke requires one cell whose CPU estimate is larger than every other cell's.");
         }
 
-        m_PrimaryCell = normals[0];
-        m_CancellationCell = normals[1];
-        m_FailureCell = failure;
-        m_NearSource = GetCellCenter(world.Partition, m_PrimaryCell.Key.Coordinate);
-        m_CancellationSource = FindCancellationSource(
-            m_PrimaryCell.Key.Coordinate,
-            m_CancellationCell.Key.Coordinate);
-        int farX = world.Cells.Max(cell => cell.Key.Coordinate.X) +
-            world.Partition.LoadRadius +
-            world.Partition.UnloadHysteresis +
-            3;
-        m_FarSource = GetCellCenter(
-            world.Partition,
-            new WorldCellCoordinate(
-                farX,
-                m_PrimaryCell.Key.Coordinate.Y,
-                m_PrimaryCell.Key.Coordinate.Z));
+        // The injected admission failure is only observable from a pose whose plan selects the
+        // oversized cell: a source that never reaches it would leave the scenario waiting for a
+        // state its own streaming source cannot produce. Keep the canonical lowest-X ordering among
+        // the cells that can reach it, so a single lane keeps its published arrangement and a dense
+        // planar grid picks a pose beside the oversized cell instead of the far edge of the world.
+        WorldCellDescriptor[] normals = ordered[..^1];
+        int radius = world.Partition.LoadRadius;
+        foreach (WorldCellDescriptor primary in normals
+            .Where(cell => ChebyshevDistance(cell.Key.Coordinate, failure.Key.Coordinate) <= radius)
+            .OrderBy(cell => Math.Abs(cell.Key.Coordinate.X))
+            .ThenBy(cell => cell.Id))
+        {
+            HashSet<WorldCellId> plan = ExpectedDesiredCells(world, primary.Key.Coordinate);
+            if (!plan.Contains(primary.Id) || !plan.Contains(failure.Id))
+            {
+                continue;
+            }
+
+            foreach (WorldCellDescriptor cancellation in normals
+                .Where(cell => cell.Id != primary.Id && plan.Contains(cell.Id))
+                .OrderBy(cell => Math.Abs(cell.Key.Coordinate.X))
+                .ThenBy(cell => cell.Id))
+            {
+                if (!TryFindCancellationSource(
+                        primary.Key.Coordinate,
+                        cancellation.Key.Coordinate,
+                        out WorldPosition cancellationSource))
+                {
+                    continue;
+                }
+
+                m_PrimaryCell = primary;
+                m_CancellationCell = cancellation;
+                m_FailureCell = failure;
+                m_AdmissionSource = GetCellCenter(world.Partition, primary.Key.Coordinate);
+                m_CancellationSource = cancellationSource;
+                int farX = world.Cells.Max(cell => cell.Key.Coordinate.X) +
+                    world.Partition.LoadRadius +
+                    world.Partition.UnloadHysteresis +
+                    3;
+                m_FarSource = GetCellCenter(
+                    world.Partition,
+                    new WorldCellCoordinate(
+                        farX,
+                        primary.Key.Coordinate.Y,
+                        primary.Key.Coordinate.Z));
+                return;
+            }
+        }
+
+        throw new InvalidOperationException(
+            "World-streaming smoke could not find a primary cell whose load radius selects both the " +
+            "oversized cell and a cancellable neighbour.");
     }
 
     private void ConfigureValidationBudgets()
@@ -431,6 +471,16 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
             m_ValidationCamera = entity;
             m_ValidationCameraWorldPosition = m_Origin.ToWorld(transform.Position);
             m_ValidationCameraRotation = transform.Rotation;
+            // The authored viewer pose is the streaming source of every observation that has to see
+            // the world the way a player does: the soak cycles and the shadow captures stream the
+            // cells under the authored camera, so the terrain the plan selected and the persistent
+            // scene's static meshes stand in front of one camera instead of in different cells. The
+            // admission and cancellation probes drive the source away from this pose on purpose,
+            // because a settled player pose cannot produce an admission failure or a cancellation;
+            // the scenario returns here - and waits for this pose's own plan to settle - before it
+            // captures the 'during' checkpoint, so every rendered frame belongs to the pose that
+            // produced it.
+            m_ViewSource = m_ValidationCameraWorldPosition;
             m_HasValidationCamera = true;
         }
 
@@ -443,15 +493,6 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void SetValidationCameraRetreat(float retreat)
     {
-        if (!m_HasValidationCamera ||
-            m_EntityManager == null ||
-            !m_EntityManager.IsAlive(m_ValidationCamera) ||
-            !m_EntityManager.HasComponent<TransformComponent>(m_ValidationCamera))
-        {
-            throw new InvalidOperationException(
-                "World-streaming visual validation camera is no longer available.");
-        }
-
         Vector3 forward = Vector3.Transform(Vector3.UnitZ, m_ValidationCameraRotation);
         float forwardLengthSquared = forward.LengthSquared();
         if (!float.IsFinite(retreat) || retreat < 0.0f ||
@@ -462,10 +503,23 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         }
 
         forward /= MathF.Sqrt(forwardLengthSquared);
-        var worldPosition = new WorldPosition(
+        ApplyValidationCameraPose(new WorldPosition(
             m_ValidationCameraWorldPosition.X - forward.X * retreat,
             m_ValidationCameraWorldPosition.Y - forward.Y * retreat,
-            m_ValidationCameraWorldPosition.Z - forward.Z * retreat);
+            m_ValidationCameraWorldPosition.Z - forward.Z * retreat));
+    }
+
+    private void ApplyValidationCameraPose(WorldPosition worldPosition)
+    {
+        if (!m_HasValidationCamera ||
+            m_EntityManager == null ||
+            !m_EntityManager.IsAlive(m_ValidationCamera) ||
+            !m_EntityManager.HasComponent<TransformComponent>(m_ValidationCamera))
+        {
+            throw new InvalidOperationException(
+                "World-streaming visual validation camera is no longer available.");
+        }
+
         if (!m_Origin.TryToOriginRelative(worldPosition, out Vector3 originRelativePosition))
         {
             throw new InvalidOperationException(
@@ -481,7 +535,10 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void BeginInitialRequest()
     {
-        m_Streaming.SetStreamingSource(m_NearSource);
+        // The first request is the admission probe. Its pose is the one whose plan selects both the
+        // oversized cell that has to fail admission and the queued neighbour that is cancelled
+        // next; the camera stays on the authored startup pose that the 'before' capture observed.
+        m_Streaming.SetStreamingSource(m_AdmissionSource);
         m_Stage = WorldStreamingSmokeStage.AwaitInitialPlan;
     }
 
@@ -513,6 +570,23 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
             return;
         }
 
+        CaptureCheckpoint("cancelled", frameIndex, expected);
+        // The probe pose is a corner of the region rather than where the camera stands, so a capture
+        // taken here would frame cells the authored viewer never sees. The source returns to the
+        // authored pose instead, and the 'during' checkpoint and its capture below wait for that
+        // pose's plan - the cells the streaming policy selects there, including the probe cells
+        // still inside the unload hysteresis - to settle first.
+        m_Streaming.SetStreamingSource(m_ViewSource);
+        m_Stage = WorldStreamingSmokeStage.AwaitDuringSettle;
+    }
+
+    private void ObserveDuringSettle(uint frameIndex)
+    {
+        // Derived from the world descriptor and the live policy, so the identity of the retained
+        // probe cells follows the hysteresis rather than a fixture-authored list.
+        WorldCellId[] expected = ExpectedActiveCells(m_ViewSource);
+        if (!ActiveCellIds().SequenceEqual(expected)) return;
+
         CaptureCheckpoint("during", frameIndex, expected);
         if (ScheduleVisualCapture("during", checked(frameIndex + 1)))
         {
@@ -532,13 +606,16 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void BeginSoakLoad()
     {
-        m_Streaming.SetStreamingSource(m_NearSource);
+        // The soak cycles and the shadow captures that follow them stream around the authored
+        // viewer pose, so every capture observes the terrain the plan selected under the camera
+        // that renders it, exactly as a runtime streams around its player.
+        m_Streaming.SetStreamingSource(m_ViewSource);
         m_Stage = WorldStreamingSmokeStage.AwaitSoakLoad;
     }
 
     private void ObserveSoakLoad(uint frameIndex)
     {
-        WorldCellId[] expected = ExpectedActiveCells(m_NearSource);
+        WorldCellId[] expected = ExpectedActiveCells(m_ViewSource);
         if (!ActiveCellIds().SequenceEqual(expected.Order())) return;
 
         WorldStreamingSmokeCheckpoint checkpoint = CaptureCheckpoint(
@@ -978,9 +1055,10 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
     /// distance, so the cancellation pose stays as close to the retained cell as the contract
     /// allows and the resulting expectation stays deterministic.
     /// </remarks>
-    private WorldPosition FindCancellationSource(
+    private bool TryFindCancellationSource(
         WorldCellCoordinate retained,
-        WorldCellCoordinate cancelled)
+        WorldCellCoordinate cancelled,
+        out WorldPosition source)
     {
         WorldPartitionSettings partition = m_World!.Partition;
         int radius = partition.LoadRadius;
@@ -1012,11 +1090,12 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 
         if (bestCandidate == null)
         {
-            throw new InvalidOperationException(
-                "World-streaming smoke could not find a source that retains the primary cell while cancelling the queued cell.");
+            source = default;
+            return false;
         }
 
-        return GetCellCenter(partition, bestCandidate.Value);
+        source = GetCellCenter(partition, bestCandidate.Value);
+        return true;
     }
 
     /// <summary>
@@ -1180,6 +1259,7 @@ internal enum WorldStreamingSmokeStage
     AwaitBeforeCapture,
     AwaitInitialPlan,
     AwaitCancellationAndPrimary,
+    AwaitDuringSettle,
     AwaitDuringCapture,
     AwaitFirstUnload,
     AwaitSoakLoad,

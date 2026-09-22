@@ -245,6 +245,23 @@ public interface IRuntimeAssetResidencyService
     RuntimeAssetResidencyMetrics GetMetrics();
 }
 
+/// <summary>
+/// A required dependency could not be acquired because a previous runtime generation of the same
+/// asset is still completing its deterministic cleanup, which the frame boundary drives to
+/// completion. The condition is a state transition the caller can wait for, not a permanent failure:
+/// a streamed cell that is unloaded and loaded again releases its dependencies and re-acquires them
+/// for the new generation, so the request has to be deferred and retried instead of losing the cell.
+/// The condition is reported as its own type because the caller has to tell it apart from a
+/// dependency that genuinely cannot be satisfied.
+/// </summary>
+public sealed class RuntimeAssetResidencyCleanupPendingException : InvalidOperationException
+{
+    public RuntimeAssetResidencyCleanupPendingException(string message)
+        : base(message)
+    {
+    }
+}
+
 public sealed class RuntimeAssetResidencyLease : IDisposable
 {
     private const int ReleaseActive = 0;
@@ -437,12 +454,20 @@ public sealed class RuntimeAssetResidencyService : IRuntimeAssetResidencyService
             foreach ((RuntimeAssetResidencyKey key, bool required) in plan)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!TryAcquireResource(owner, ownerEntry, key, out string diagnostic))
+                if (!TryAcquireResource(
+                        owner,
+                        ownerEntry,
+                        key,
+                        out string diagnostic,
+                        out bool cleanupPending))
                 {
                     if (required)
                     {
-                        throw new InvalidDataException(
-                            $"Required runtime asset '{key}' could not be acquired. {diagnostic}");
+                        string message =
+                            $"Required runtime asset '{key}' could not be acquired. {diagnostic}";
+                        throw cleanupPending
+                            ? new RuntimeAssetResidencyCleanupPendingException(message)
+                            : new InvalidDataException(message);
                     }
 
                     Logger.Warning($"[RuntimeAssetResidency] Optional runtime asset '{key}' was skipped. {diagnostic}");
@@ -1191,8 +1216,10 @@ public sealed class RuntimeAssetResidencyService : IRuntimeAssetResidencyService
         RuntimeAssetResidencyOwnerId owner,
         OwnerEntry ownerEntry,
         RuntimeAssetResidencyKey key,
-        out string diagnostic)
+        out string diagnostic,
+        out bool cleanupPending)
     {
+        cleanupPending = false;
         lock (m_Gate)
         {
             EnsureOwnerAcquisitionActiveLocked(owner, ownerEntry);
@@ -1201,6 +1228,7 @@ public sealed class RuntimeAssetResidencyService : IRuntimeAssetResidencyService
             {
                 diagnostic =
                     "A previous runtime asset generation is still completing deterministic cleanup.";
+                cleanupPending = true;
                 return false;
             }
 
@@ -1260,6 +1288,7 @@ public sealed class RuntimeAssetResidencyService : IRuntimeAssetResidencyService
                 {
                     diagnostic =
                         "A previous runtime asset generation is still completing deterministic cleanup.";
+                    cleanupPending = true;
                 }
                 else if (m_Resources.TryGetValue(key, out ResourceEntry? raced))
                 {
