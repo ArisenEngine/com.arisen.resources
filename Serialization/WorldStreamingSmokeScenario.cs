@@ -359,7 +359,6 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
         m_FailureCell = failure;
         m_NearSource = GetCellCenter(world.Partition, m_PrimaryCell.Key.Coordinate);
         m_CancellationSource = FindCancellationSource(
-            world.Partition,
             m_PrimaryCell.Key.Coordinate,
             m_CancellationCell.Key.Coordinate);
         int farX = world.Cells.Max(cell => cell.Key.Coordinate.X) +
@@ -502,13 +501,19 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void ObserveCancellationAndPrimary(uint frameIndex)
     {
+        // The checkpoint expectation is derived from the world descriptor rather than authored
+        // per fixture: the source sits on the cancellation pose, so the cells that must still be
+        // active are exactly the ones the streaming policy keeps selected there. A dense planar
+        // cell grid keeps more than the primary cell, and a hand-written list would report that
+        // correct arrangement as an unexpected active-cell set.
+        WorldCellId[] expected = ExpectedActiveCells(m_CancellationSource);
         if (!m_ObservedStates.Contains(WorldCellStreamingState.Cancelled) ||
-            GetCell(m_PrimaryCell!.Id).State != WorldCellStreamingState.Active)
+            !ActiveCellIds().SequenceEqual(expected))
         {
             return;
         }
 
-        CaptureCheckpoint("during", frameIndex, [m_PrimaryCell.Id]);
+        CaptureCheckpoint("during", frameIndex, expected);
         if (ScheduleVisualCapture("during", checked(frameIndex + 1)))
         {
             m_Stage = WorldStreamingSmokeStage.AwaitDuringCapture;
@@ -533,7 +538,7 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void ObserveSoakLoad(uint frameIndex)
     {
-        WorldCellId[] expected = [m_PrimaryCell!.Id, m_CancellationCell!.Id];
+        WorldCellId[] expected = ExpectedActiveCells(m_NearSource);
         if (!ActiveCellIds().SequenceEqual(expected.Order())) return;
 
         WorldStreamingSmokeCheckpoint checkpoint = CaptureCheckpoint(
@@ -960,23 +965,175 @@ internal sealed class WorldStreamingSmokeScenario : IRuntimeSmokeScenario
             origin.Z + partition.CellSize.Z * 0.5);
     }
 
-    private static WorldPosition FindCancellationSource(
-        WorldPartitionSettings partition,
+    /// <summary>
+    /// Streaming source that keeps the retained cell selected while pushing the cancelled cell
+    /// out of the load radius, so the scenario can observe a cancellation and still capture a
+    /// checkpoint on a settled active set.
+    /// </summary>
+    /// <remarks>
+    /// The search walks the whole horizontal load neighbourhood instead of one axis. A canonical
+    /// single-lane fixture only ever needed the second cell along X, but a planar open-world grid
+    /// has neighbours on both axes, and an axis-only search cannot cancel a cell that sits beside
+    /// the retained one. Candidates are ranked by how few cells they leave active and then by
+    /// distance, so the cancellation pose stays as close to the retained cell as the contract
+    /// allows and the resulting expectation stays deterministic.
+    /// </remarks>
+    private WorldPosition FindCancellationSource(
         WorldCellCoordinate retained,
         WorldCellCoordinate cancelled)
     {
+        WorldPartitionSettings partition = m_World!.Partition;
         int radius = partition.LoadRadius;
+        WorldCellCoordinate? bestCandidate = null;
+        int bestActiveCount = int.MaxValue;
+        int bestDistance = int.MaxValue;
         for (int x = retained.X - radius; x <= retained.X + radius; x++)
         {
-            var candidate = new WorldCellCoordinate(x, retained.Y, retained.Z);
-            if (ChebyshevDistance(candidate, cancelled) > radius)
+            for (int z = retained.Z - radius; z <= retained.Z + radius; z++)
             {
-                return GetCellCenter(partition, candidate);
+                var candidate = new WorldCellCoordinate(x, retained.Y, z);
+                if (ChebyshevDistance(candidate, retained) > radius ||
+                    ChebyshevDistance(candidate, cancelled) <= radius)
+                {
+                    continue;
+                }
+
+                int activeCount = ExpectedActiveCells(GetCellCenter(partition, candidate)).Length;
+                int distance = Math.Abs(x - retained.X) + Math.Abs(z - retained.Z);
+                if (activeCount < bestActiveCount ||
+                    (activeCount == bestActiveCount && distance < bestDistance))
+                {
+                    bestCandidate = candidate;
+                    bestActiveCount = activeCount;
+                    bestDistance = distance;
+                }
             }
         }
 
-        throw new InvalidOperationException(
-            "World-streaming smoke could not find a source that retains the primary cell while cancelling the queued cell.");
+        if (bestCandidate == null)
+        {
+            throw new InvalidOperationException(
+                "World-streaming smoke could not find a source that retains the primary cell while cancelling the queued cell.");
+        }
+
+        return GetCellCenter(partition, bestCandidate.Value);
+    }
+
+    /// <summary>
+    /// Active set the streaming policy must reach for a source position, derived from the world
+    /// descriptor and the configured budgets.
+    /// </summary>
+    /// <remarks>
+    /// The expectation mirrors <c>RuntimeWorldStreamingService.PlanDesiredCells</c> and the read
+    /// admission that follows it: camera candidates are the declared cells inside
+    /// <c>LoadRadius</c>, cells that are already active stay selected inside
+    /// <c>LoadRadius + UnloadHysteresis</c>, the dependency closure of a candidate has to fit
+    /// <c>MaxActiveCells</c>, and a cell whose staging reservation exceeds the decoded staging
+    /// budget fails instead of activating. Deriving the set means the fixture follows any authored
+    /// cell arrangement - including the dense planar grids a streaming open world uses - instead of
+    /// pinning the one arrangement of the canonical world.
+    /// </remarks>
+    private WorldCellId[] ExpectedActiveCells(WorldPosition source)
+    {
+        WorldDescriptor world = m_World!;
+        WorldCellCoordinate sourceCoordinate =
+            WorldPartitionCoordinates.GetCoordinate(world.Partition, source);
+        return ExpectedDesiredCells(world, sourceCoordinate)
+            .Where(id => !FailsAdmission(world, id))
+            .Order()
+            .ToArray();
+    }
+
+    private HashSet<WorldCellId> ExpectedDesiredCells(
+        WorldDescriptor world,
+        WorldCellCoordinate sourceCoordinate)
+    {
+        int radius = world.Partition.LoadRadius;
+        int hysteresis = world.Partition.UnloadHysteresis;
+        var selected = new HashSet<WorldCellId>();
+        foreach (WorldCellStreamingSnapshot cell in m_Streaming.GetCells())
+        {
+            if (cell.State is not (WorldCellStreamingState.Active or
+                WorldCellStreamingState.QueuedToUnload or
+                WorldCellStreamingState.Unloading))
+            {
+                continue;
+            }
+
+            WorldCellDescriptor? descriptor = world.Cells
+                .FirstOrDefault(candidate => candidate.Id == cell.CellId);
+            if (descriptor == null) continue;
+            if (ChebyshevDistance(sourceCoordinate, descriptor.Key.Coordinate) <=
+                radius + hysteresis)
+            {
+                selected.Add(cell.CellId);
+            }
+        }
+
+        WorldCellDescriptor[] candidates = world.Cells
+            .Where(cell => ChebyshevDistance(sourceCoordinate, cell.Key.Coordinate) <= radius)
+            .OrderBy(cell => ChebyshevDistance(sourceCoordinate, cell.Key.Coordinate))
+            .ThenBy(cell => LayerPriority(world, cell.Key.Layer))
+            .ThenBy(cell => cell.Id)
+            .ToArray();
+        foreach (WorldCellDescriptor candidate in candidates)
+        {
+            HashSet<WorldCellId> closure = DependencyClosure(world, candidate);
+            int additional = closure.Count(id => !selected.Contains(id));
+            if (selected.Count + additional > world.Partition.MaxActiveCells)
+            {
+                continue;
+            }
+
+            selected.UnionWith(closure);
+        }
+
+        return selected;
+    }
+
+    private static HashSet<WorldCellId> DependencyClosure(
+        WorldDescriptor world,
+        WorldCellDescriptor root)
+    {
+        var closure = new HashSet<WorldCellId>();
+        var pending = new Stack<WorldCellId>();
+        pending.Push(root.Id);
+        while (pending.Count > 0)
+        {
+            WorldCellId id = pending.Pop();
+            if (!closure.Add(id)) continue;
+            WorldCellDescriptor descriptor = world.Cells.Single(cell => cell.Id == id);
+            for (int index = 0; index < descriptor.Dependencies.Count; index++)
+            {
+                pending.Push(descriptor.Dependencies[index]);
+            }
+        }
+
+        return closure;
+    }
+
+    private static int LayerPriority(WorldDescriptor world, string layer)
+    {
+        for (int index = 0; index < world.Layers.Count; index++)
+        {
+            if (string.Equals(world.Layers[index].Id, layer, StringComparison.Ordinal))
+            {
+                return world.Layers[index].Priority;
+            }
+        }
+
+        return int.MaxValue;
+    }
+
+    private bool FailsAdmission(WorldDescriptor world, WorldCellId id)
+    {
+        WorldCellDescriptor descriptor = world.Cells.Single(cell => cell.Id == id);
+        long inFlightBytes = descriptor.ScenePayloadBytes > 0
+            ? descriptor.ScenePayloadBytes
+            : Math.Max(1, Math.Min(descriptor.EstimatedCpuBytes, 16L * 1024 * 1024));
+        long stagingBytes = Math.Max(inFlightBytes, descriptor.EstimatedCpuBytes);
+        return inFlightBytes > m_Streaming.Budgets.MaxBytesInFlight ||
+            stagingBytes > m_Streaming.Budgets.MaxDecodedStagingBytes;
     }
 
     private static int ChebyshevDistance(
