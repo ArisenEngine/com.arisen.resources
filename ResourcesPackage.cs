@@ -65,14 +65,18 @@ public class ResourcesPackage : IPackageEntry
         m_AssetDatabase = database;
         try
         {
-#if ARISEN_PROFILE_PRODUCTION
+#if ARISEN_DEPLOYED
             if (config?.ExecutionMode == EngineExecutionMode.RuntimeAssetCook)
             {
                 database.InitializeWorkspace(workspaceRoot, packages, sourceAccessMode);
             }
             else
             {
-                database.InitializeRuntimeCatalog(AppContext.BaseDirectory, "Production");
+                database.InitializeRuntimeCatalog(
+                    AppContext.BaseDirectory,
+                    config?.Profile ?? throw new InvalidOperationException(
+                        "[Resources] A deployed profile must resolve its workspace profile name " +
+                        "before the runtime asset catalog can be mounted."));
             }
 #else
             database.InitializeWorkspace(workspaceRoot, packages, sourceAccessMode);
