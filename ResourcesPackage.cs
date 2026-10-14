@@ -18,6 +18,7 @@ public class ResourcesPackage : IPackageEntry
     private WorldOriginService? m_WorldOriginService;
     private RuntimeSmokeScenarioRegistry? m_SmokeScenarioRegistry;
     private WorldStreamingSmokeScenarioProvider? m_WorldStreamingSmokeProvider;
+    private SampleSwitchSmokeScenarioProvider? m_SampleSwitchSmokeProvider;
     private IRuntimeAssetCookerRegistry? m_RuntimeAssetCookerRegistry;
     private SceneRuntimeAssetCooker? m_SceneRuntimeAssetCooker;
     private WorldRuntimeAssetCooker? m_WorldRuntimeAssetCooker;
@@ -33,6 +34,7 @@ public class ResourcesPackage : IPackageEntry
         m_WorldOriginService != null ||
         m_SmokeScenarioRegistry != null ||
         m_WorldStreamingSmokeProvider != null ||
+        m_SampleSwitchSmokeProvider != null ||
         m_RuntimeAssetCookerRegistry != null ||
         m_SceneRuntimeAssetCooker != null ||
         m_WorldRuntimeAssetCooker != null ||
@@ -129,6 +131,16 @@ public class ResourcesPackage : IPackageEntry
                 database,
                 registry.GetService<IBackgroundTaskScheduler>());
             m_SmokeScenarioRegistry.Register("world-streaming", m_WorldStreamingSmokeProvider);
+            m_SampleSwitchSmokeProvider = new SampleSwitchSmokeScenarioProvider(
+                m_SampleCatalogueService,
+                m_RuntimeWorldStreamingService,
+                m_RuntimeSceneService,
+                m_RuntimeAssetResidencyService,
+                registry.GetService<IBackgroundTaskScheduler>(),
+                database);
+            m_SmokeScenarioRegistry.Register(
+                SampleSwitchSmokeScenarioProvider.ModeName,
+                m_SampleSwitchSmokeProvider);
             registry.RegisterService<IRuntimeSmokeScenarioRegistry>(m_SmokeScenarioRegistry);
             registry.RegisterService<IRuntimeSmokeScenarioProvider>(m_SmokeScenarioRegistry);
             EngineKernel.Instance.OnFrameEnd += ProcessPendingSceneLoad;
@@ -204,10 +216,12 @@ public class ResourcesPackage : IPackageEntry
             return;
         }
 
-        if (m_SmokeScenarioRegistry != null || m_WorldStreamingSmokeProvider != null)
+        if (m_SmokeScenarioRegistry != null ||
+            m_WorldStreamingSmokeProvider != null ||
+            m_SampleSwitchSmokeProvider != null)
         {
             AttemptUnloadStage(
-                "world-streaming smoke provider unregister",
+                "runtime smoke provider unregister",
                 () =>
                 {
                     if (m_SmokeScenarioRegistry != null && m_WorldStreamingSmokeProvider != null)
@@ -216,16 +230,26 @@ public class ResourcesPackage : IPackageEntry
                             "world-streaming",
                             m_WorldStreamingSmokeProvider);
                     }
+
+                    if (m_SmokeScenarioRegistry != null && m_SampleSwitchSmokeProvider != null)
+                    {
+                        m_SmokeScenarioRegistry.Unregister(
+                            SampleSwitchSmokeScenarioProvider.ModeName,
+                            m_SampleSwitchSmokeProvider);
+                    }
                 },
                 () =>
                 {
                     m_WorldStreamingSmokeProvider = null;
+                    m_SampleSwitchSmokeProvider = null;
                     m_SmokeScenarioRegistry = null;
                 },
                 failures);
         }
 
-        if (m_SmokeScenarioRegistry != null || m_WorldStreamingSmokeProvider != null)
+        if (m_SmokeScenarioRegistry != null ||
+            m_WorldStreamingSmokeProvider != null ||
+            m_SampleSwitchSmokeProvider != null)
         {
             return;
         }
