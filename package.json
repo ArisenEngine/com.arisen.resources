@@ -21,6 +21,7 @@
       "ArisenEngine.Resources.Serialization.IRuntimeWorldStreamingService",
       "ArisenEngine.Resources.Serialization.IRuntimeAssetResidencyService",
       "ArisenEngine.Resources.Serialization.IWorldOriginService",
+      "ArisenEngine.Resources.Serialization.ISampleCatalogueService",
       "ArisenKernel.Lifecycle.IRuntimeSmokeScenarioRegistry",
       "ArisenKernel.Lifecycle.IRuntimeSmokeScenarioProvider"
     ],

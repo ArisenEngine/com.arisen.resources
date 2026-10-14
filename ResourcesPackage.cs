@@ -21,6 +21,8 @@ public class ResourcesPackage : IPackageEntry
     private IRuntimeAssetCookerRegistry? m_RuntimeAssetCookerRegistry;
     private SceneRuntimeAssetCooker? m_SceneRuntimeAssetCooker;
     private WorldRuntimeAssetCooker? m_WorldRuntimeAssetCooker;
+    private SampleCatalogueRuntimeAssetCooker? m_SampleCatalogueRuntimeAssetCooker;
+    private SampleCatalogueService? m_SampleCatalogueService;
     private bool m_FrameEndSubscribed;
 
     public bool HasPendingOwnership =>
@@ -34,6 +36,8 @@ public class ResourcesPackage : IPackageEntry
         m_RuntimeAssetCookerRegistry != null ||
         m_SceneRuntimeAssetCooker != null ||
         m_WorldRuntimeAssetCooker != null ||
+        m_SampleCatalogueRuntimeAssetCooker != null ||
+        m_SampleCatalogueService != null ||
         m_FrameEndSubscribed;
 
     public void OnLoad(IServiceRegistry registry)
@@ -90,8 +94,10 @@ public class ResourcesPackage : IPackageEntry
             m_RuntimeAssetCookerRegistry = cookerRegistry;
             m_SceneRuntimeAssetCooker = new SceneRuntimeAssetCooker(database);
             m_WorldRuntimeAssetCooker = new WorldRuntimeAssetCooker(database);
+            m_SampleCatalogueRuntimeAssetCooker = new SampleCatalogueRuntimeAssetCooker(database);
             cookerRegistry.RegisterCooker(m_SceneRuntimeAssetCooker);
             cookerRegistry.RegisterCooker(m_WorldRuntimeAssetCooker);
+            cookerRegistry.RegisterCooker(m_SampleCatalogueRuntimeAssetCooker);
 
             var sceneSubsystem = EngineKernel.Instance.GetSubsystem<SceneSubsystem>()
                 ?? throw new InvalidOperationException("Runtime scene service requires SceneSubsystem to be selected.");
@@ -103,6 +109,10 @@ public class ResourcesPackage : IPackageEntry
             registry.RegisterService<IRuntimeAssetResidencyService>(m_RuntimeAssetResidencyService);
             m_WorldOriginService = new WorldOriginService();
             registry.RegisterService<IWorldOriginService>(m_WorldOriginService);
+            m_SampleCatalogueService = new SampleCatalogueService(
+                database,
+                registry.GetService<ProjectSubsystem>());
+            registry.RegisterService<ISampleCatalogueService>(m_SampleCatalogueService);
             m_RuntimeWorldStreamingService = new RuntimeWorldStreamingService(
                 database,
                 m_RuntimeSceneService,
@@ -259,7 +269,8 @@ public class ResourcesPackage : IPackageEntry
             m_RuntimeAssetResidencyService == null &&
             m_RuntimeAssetCookerRegistry == null &&
             m_SceneRuntimeAssetCooker == null &&
-            m_WorldRuntimeAssetCooker == null;
+            m_WorldRuntimeAssetCooker == null &&
+            m_SampleCatalogueRuntimeAssetCooker == null;
         if (assetDatabaseDependenciesReleased && m_AssetDatabase != null)
         {
             AttemptUnloadStage(
@@ -270,6 +281,7 @@ public class ResourcesPackage : IPackageEntry
         }
 
         m_WorldOriginService = null;
+        m_SampleCatalogueService = null;
     }
 
     private void UnregisterRuntimeAssetCookers(
@@ -302,7 +314,19 @@ public class ResourcesPackage : IPackageEntry
                 failures);
         }
 
-        if (m_WorldRuntimeAssetCooker == null && m_SceneRuntimeAssetCooker == null)
+        if (m_SampleCatalogueRuntimeAssetCooker != null)
+        {
+            SampleCatalogueRuntimeAssetCooker cooker = m_SampleCatalogueRuntimeAssetCooker;
+            AttemptUnloadStage(
+                $"{context} sample catalogue runtime asset cooker unregister",
+                () => cookerRegistry.UnregisterCooker(cooker),
+                () => m_SampleCatalogueRuntimeAssetCooker = null,
+                failures);
+        }
+
+        if (m_WorldRuntimeAssetCooker == null &&
+            m_SceneRuntimeAssetCooker == null &&
+            m_SampleCatalogueRuntimeAssetCooker == null)
         {
             m_RuntimeAssetCookerRegistry = null;
         }
